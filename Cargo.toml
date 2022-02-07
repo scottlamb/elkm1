@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "elkm1",
+    "elkm1-cli",
+]

@@ -1,0 +1,31 @@
+[package]
+name = "elkm1"
+version = "0.0.1"
+edition = "2021"
+license = "MIT/Apache-2.0"
+description = "Elk M1 Security and Automation Control System"
+categories = ["hardware-support"]
+keywords = ["elkm1", "security", "automation"]
+rust-version = "1.60"
+repository = "https://github.com/scottlamb/elkm1"
+readme = "../README.md"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bytes = "1.1.0"
+futures = "0.3.14"
+memchr = "2.4.1"
+pretty-hex = "0.2.1"
+tokio = { version = "1.16.1", features = ["net"], optional = true }
+tokio-util = { version = "0.6.6", features = ["codec"], optional = true }
+
+[features]
+default = ["tokio"]
+tokio = ["dep:tokio", "dep:tokio-util"]
+
+[package.metadata.docs.rs]
+# https://docs.rs/about/metadata
+# To generate docs locally, run: RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features
+rustdoc-args = ["--cfg", "docsrs"]
+all-features = true
