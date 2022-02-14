@@ -100,7 +100,7 @@ messages! {
     struct ArmingStatusRequest {}
 
     /// `AS`: Arming Status Report.
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     struct ArmingStatusReport {
         pub arming_status: [ArmingStatus; NUM_AREAS],
         pub up_state: [ArmUpState; NUM_AREAS],
@@ -312,7 +312,7 @@ macro_rules! limited_u8 {
 
         impl $t {
             pub fn to_index(self) -> usize {
-                self.0 as usize
+                self.0 as usize - 1
             }
         }
 
@@ -447,7 +447,7 @@ impl ZoneStatus {
     }
 
     pub fn logical(self) -> ZoneLogicalStatus {
-        match self.0 >> 4 {
+        match self.0 >> 2 {
             0b00 => ZoneLogicalStatus::Normal,
             0b01 => ZoneLogicalStatus::Trouble,
             0b10 => ZoneLogicalStatus::Violated,
@@ -457,7 +457,7 @@ impl ZoneStatus {
     }
 
     pub fn physical(self) -> ZonePhysicalStatus {
-        match self.0 >> 4 {
+        match self.0 & 0b11 {
             0b00 => ZonePhysicalStatus::Unconfigured,
             0b01 => ZonePhysicalStatus::Open,
             0b10 => ZonePhysicalStatus::EOL,
@@ -741,6 +741,14 @@ impl TextDescription {
     fn as_padded_str(&self) -> &str {
         std::str::from_utf8(&self.0[..]).unwrap()
     }
+
+    pub fn as_str(&self) -> &str {
+        self.as_padded_str().trim_end_matches(' ')
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0[0] == b' '
+    }
 }
 
 #[cfg(feature = "arbitrary")]
@@ -769,11 +777,24 @@ impl std::fmt::Debug for TextDescription {
     }
 }
 
+impl std::fmt::Display for TextDescription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&**self, f)
+    }
+}
+
 impl std::ops::Deref for TextDescription {
     type Target = str;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
-        self.as_padded_str().trim_end_matches(' ')
+        self.as_str()
+    }
+}
+
+impl std::cmp::PartialEq<str> for TextDescription {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
     }
 }
 
@@ -805,7 +826,15 @@ impl StringDescriptionResponse {
         matches!(
             request,
             Message::StringDescriptionRequest(StringDescriptionRequest { ty, num })
-            if self.ty == *ty && self.num == *num
+
+            // > If the first character in a requested name is a “space” or
+            // > less, then the next names are searched until a name is found
+            // > whose first character is greater than “space” or the “Show On
+            // > Keypad” bit is set. If no valid names are found, a “000” for
+            // > the NNN address is returned. This speeds up the loading of
+            // > names so that invalid names are not returned. M1 version 2.4.6
+            // or later.
+            if self.ty == *ty && (self.num >= *num || self.num == 0)
         )
     }
 }
@@ -815,7 +844,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn valid_ee() {
+    fn valid_ee_report() {
         let pkt = Packet::Ascii(AsciiPacket::try_from("EE11030000100").unwrap());
         let msg = Message::parse(&pkt).unwrap().unwrap();
         assert_eq!(
@@ -832,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_sd() {
+    fn valid_sd_req() {
         let pkt = Packet::Ascii(AsciiPacket::try_from("sd0100100").unwrap());
         let msg = Message::parse(&pkt).unwrap().unwrap();
         assert_eq!(
@@ -846,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_SD() {
+    fn valid_sd_report() {
         let pkt = Packet::Ascii(AsciiPacket::try_from("SD05001Garage Door     00").unwrap());
         let msg = Message::parse(&pkt).unwrap().unwrap();
         assert_eq!(
@@ -861,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn valid_zc() {
+    fn valid_zc_report() {
         let pkt = Packet::Ascii(AsciiPacket::try_from("ZC016900").unwrap());
         let msg = Message::parse(&pkt).unwrap().unwrap();
         assert_eq!(

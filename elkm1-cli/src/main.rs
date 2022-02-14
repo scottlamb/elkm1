@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use bytes::BytesMut;
 use clap::Parser;
-use elkm1::tokio::Connection;
-use futures::{SinkExt, StreamExt};
+use elkm1::state::Change;
+use futures::StreamExt;
 use pretty_hex::PrettyHex;
 
 #[derive(Parser)]
@@ -16,17 +16,23 @@ enum Cmd {
 }
 
 async fn watch(addr: String) {
-    //let conn = Connection::connect(&addr).await.unwrap();
-    let conn = elkm1::state::Panel::connect(&addr).await.unwrap();
+    let panel = elkm1::state::Panel::connect(&addr).await.unwrap();
     log::info!("Tracking changes.");
-    tokio::pin!(conn);
-    //conn.send(elkm1::msg::ZoneStatusRequest{}.to_ascii().into()).await.unwrap();
-    while let Some(pkt) = conn.next().await {
+    tokio::pin!(panel);
+    while let Some(pkt) = panel.next().await {
         let pkt = pkt.unwrap();
-        log::info!("received {:#?}", &pkt);
-        //if let Some(msg) = elkm1::msg::Message::parse(&pkt).unwrap() {
-        //    log::info!("parsed as {:#?}", msg);
-        //}
+        log::debug!("received {:#?}", &pkt);
+        match pkt.change {
+            Some(Change::ZoneChange { zone, prior }) => {
+                log::info!(
+                    "{}: {:?} -> {:?}",
+                    panel.zone_name(zone),
+                    prior,
+                    panel.zone_status()[zone.to_index()],
+                );
+            }
+            _ => {}
+        }
     }
 }
 

@@ -52,15 +52,15 @@ use futures::{Sink, SinkExt, Stream, StreamExt};
 use tokio::net::ToSocketAddrs;
 
 use crate::msg::{
-    ArmingStatusRequest, Message, StringDescriptionRequest, ZoneChange, ZoneLogicalStatus,
-    ZonePhysicalStatus, ZoneStatus, ZoneStatusRequest, NUM_AREAS, NUM_ZONES,
+    ArmingStatusReport, ArmingStatusRequest, Message, StringDescriptionRequest, TextDescription,
+    TextDescriptionType, Zone, ZoneStatus, ZoneStatusRequest, NUM_AREAS, NUM_ZONES,
 };
 use crate::pkt::Packet;
 use crate::tokio::Connection;
 
 pub struct Panel {
     conn: Connection,
-    zone_status: Option<[ZoneStatus; NUM_ZONES]>,
+    state: PanelState,
 }
 
 impl Panel {
@@ -74,26 +74,28 @@ impl Panel {
         Self::with_connection(conn).await
     }
 
+    pub fn zone_name(&self, zone: Zone) -> &TextDescription {
+        self.state.zone_names[zone.to_index()]
+            .as_ref()
+            .expect("zone_name is set post-init")
+    }
+
+    pub fn zone_status(&self) -> &[ZoneStatus; NUM_ZONES] {
+        self.state
+            .zone_status
+            .as_ref()
+            .expect("zone_status is set post-init")
+    }
+
     async fn with_connection(conn: Connection) -> Result<Self, std::io::Error> {
         let mut this = Panel {
             conn,
-            zone_status: None,
+            state: PanelState::default(),
         };
         this.init_req(ArmingStatusRequest {}.into()).await?;
         this.init_req(ZoneStatusRequest {}.into()).await?;
-        for area in 1..=NUM_AREAS {
-            println!("sending sd for {}", area);
-            this.init_req(
-                StringDescriptionRequest {
-                    ty: crate::msg::TextDescriptionType::Area,
-                    num: area as u8,
-                }
-                .into(),
-            )
-            .await?;
-        }
-        // TODO: zone names.
-        // TODO: task names.
+        this.send_sds(TextDescriptionType::Area, NUM_AREAS).await?;
+        this.send_sds(TextDescriptionType::Zone, NUM_ZONES).await?;
         /*for i in 0..NUM_ZONES {
             if this.zone_status.as_deref().unwrap()[i].physical() != ZonePhysicalStatus::Unconfigured {
                 this.init_req()
@@ -105,17 +107,59 @@ impl Panel {
     /// Sends a message as part of initialization and waits for the reply.
     ///
     /// Processes but doesn't report any other messages received while waiting.
-    async fn init_req(&mut self, send: Message) -> Result<(), std::io::Error> {
-        println!("sending: {:?}", &send);
+    async fn init_req(&mut self, send: Message) -> Result<Event, std::io::Error> {
+        log::debug!("init_req: sending {:#?}", &send);
         self.conn.send(send.to_pkt()).await?;
         while let Some(received) = self.conn.next().await {
             let received = self.interpret(received?);
-            println!("received: {:#?}", &received);
+            log::debug!("init_req: received {:#?}", &received);
             if let Some(Ok(r)) = &received.msg {
                 if r.is_reply_to(&send) {
-                    break;
+                    return Ok(received);
                 }
             }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("EOF while expecting reply to {:?}", &send),
+        ))
+    }
+
+    /// Sends a range of `sd` requests, waiting for each response.
+    async fn send_sds(
+        &mut self,
+        ty: TextDescriptionType,
+        max: usize,
+    ) -> Result<(), std::io::Error> {
+        let mut unfilled_i = 0;
+        while unfilled_i < max {
+            let num = unfilled_i as u8 + 1;
+            let reply = self
+                .init_req(StringDescriptionRequest { ty, num }.into())
+                .await?;
+            let reply = match reply.msg {
+                Some(Ok(Message::StringDescriptionResponse(r))) => r,
+                _ => unreachable!("only SD should be accepted as reply to sd"),
+            };
+            debug_assert_eq!(ty, reply.ty); // checked by SDR::is_reply_to.
+            let names = self.state.names_mut(ty).expect("have names for ty");
+            let reply_i = if let Some(i) = reply.num.checked_sub(1) {
+                i as usize
+            } else {
+                // no remaining non-empty names.
+                for j in unfilled_i..max {
+                    names[j] = Some(TextDescription::default());
+                }
+                return Ok(());
+            };
+            debug_assert!(reply_i >= unfilled_i); // checked by SDR::is_reply_to also.
+            while unfilled_i < reply_i {
+                // skipped empty names.
+                names[unfilled_i] = Some(TextDescription::default());
+                unfilled_i += 1;
+            }
+            names[unfilled_i] = Some(reply.text);
+            unfilled_i += 1;
         }
         Ok(())
     }
@@ -126,30 +170,34 @@ impl Panel {
         let mut change = None;
         if let Some(Ok(m)) = &msg {
             match m {
-                //Message::ArmingStatusRequest(_) => todo!(),
-                //Message::ArmingStatusReport(_) => todo!(),
+                Message::ArmingStatusReport(m) => {
+                    if let Some(ref prior) = self.state.arming_status {
+                        if prior != m {
+                            change = Some(Change::ArmingStatus(*prior));
+                        }
+                    }
+                    self.state.arming_status = Some(*m);
+                }
                 //Message::SendTimeData(_) => todo!(),
                 Message::ZoneChange(m) => {
-                    if let Some(ref mut s) = self.zone_status {
+                    if let Some(ref mut s) = self.state.zone_status {
                         let s = &mut s[m.zone.to_index()];
                         if *s != m.status {
-                            change = Some(Change::ZoneChange(m.clone()));
+                            change = Some(Change::ZoneChange {
+                                zone: m.zone,
+                                prior: *s,
+                            });
                         }
                         *s = m.status;
                     }
                 }
-                //Message::ZoneStatusRequest(_) => todo!(),
                 Message::ZoneStatusReport(m) => {
-                    self.zone_status = Some(m.zones);
+                    self.state.zone_status = Some(m.zones);
                 }
                 _ => {}
             }
         }
         Event { pkt, msg, change }
-    }
-
-    pub fn zone_status(&self) -> Option<&[ZoneStatus; NUM_ZONES]> {
-        self.zone_status.as_ref()
     }
 }
 
@@ -208,6 +256,47 @@ impl Sink<Command> for Panel {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct PanelState {
+    arming_status: Option<ArmingStatusReport>,
+    zone_status: Option<[ZoneStatus; NUM_ZONES]>,
+    zone_names: [Option<TextDescription>; NUM_ZONES],
+    area_names: [Option<TextDescription>; NUM_AREAS],
+}
+
+impl PanelState {
+    /// Returns a const reference to the given names, if valid/understood.
+    #[cfg(test)]
+    fn names(&self, ty: TextDescriptionType) -> Option<&[Option<TextDescription>]> {
+        Some(match ty {
+            TextDescriptionType::Area => &self.area_names[..],
+            TextDescriptionType::Zone => &self.zone_names[..],
+            _ => return None,
+        })
+    }
+
+    /// Returns a mutable reference to the given names, if valid/understood.
+    fn names_mut(&mut self, ty: TextDescriptionType) -> Option<&mut [Option<TextDescription>]> {
+        Some(match ty {
+            TextDescriptionType::Area => &mut self.area_names[..],
+            TextDescriptionType::Zone => &mut self.zone_names[..],
+            _ => return None,
+        })
+    }
+}
+
+// Implemented explicitly because there's no Default on arrays > size 32.
+impl Default for PanelState {
+    fn default() -> Self {
+        Self {
+            arming_status: None,
+            zone_status: None,
+            zone_names: [None; NUM_ZONES],
+            area_names: [None; NUM_AREAS],
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Event {
     pub pkt: crate::pkt::Packet,
@@ -215,10 +304,21 @@ pub struct Event {
     pub change: Option<Change>,
 }
 
+/// An understood state change.
+///
+/// The enum value includes the *prior* state of the panel.
+///
+/// The caller can retrieve the current state via [`Panel`] accessors. Note that
+/// if the caller wishes to learn exactly what changed in this message, it
+/// should compare them *before* calling `<Panel as futures::Stream>::poll_next`
+/// again, so that no other messages are included in the diff.
 #[derive(Clone, Debug)]
 pub enum Change {
     /// Received a `ZC` which does not match the zone's known prior state.
-    ZoneChange(ZoneChange),
+    ZoneChange { zone: Zone, prior: ZoneStatus },
+
+    /// Received a `AS` which does not match the prior arming state.
+    ArmingStatus(ArmingStatusReport),
 }
 
 #[derive(Clone, Debug)]
@@ -230,11 +330,13 @@ mod tests {
     use crate::{
         msg::{
             AlarmState, ArmUpState, ArmingStatus, ArmingStatusReport, StringDescriptionResponse,
-            TextDescription, TextDescriptionType, ZoneStatusReport, NUM_AREAS,
+            TextDescription, ZoneStatusReport, NUM_AREAS,
         },
         pkt::AsciiPacket,
         tokio::testutil::socketpair,
     };
+
+    use pretty_assertions::assert_eq;
 
     async fn send<P: Into<Packet>>(conn: &mut Connection, pkt: P) {
         conn.send(pkt.into()).await.unwrap();
@@ -246,68 +348,73 @@ mod tests {
             .unwrap();
     }
 
-    async fn next_msg(conn: &mut Connection) -> Message {
+    async fn next_msg(conn: &mut Connection) -> Option<Message> {
         let pkt = match conn.next().await {
             Some(Ok(Packet::Ascii(p))) => p,
+            None => return None,
             _ => unreachable!(),
         };
-        Message::parse_ascii(&pkt).unwrap().unwrap()
+        Some(Message::parse_ascii(&pkt).unwrap().unwrap())
+    }
+
+    /// Responds to init packets with fixed state.
+    async fn serve_init(conn: &mut Connection, state: &PanelState) {
+        while let Some(pkt) = next_msg(conn).await {
+            // Simulate asynchronous messages.
+            send_ascii(conn, "XK384014409022200000").await;
+            match pkt {
+                Message::ArmingStatusRequest(_) => {
+                    send(conn, state.arming_status.as_ref().unwrap()).await;
+                }
+                Message::ZoneStatusRequest(_) => {
+                    send(
+                        conn,
+                        &ZoneStatusReport {
+                            zones: state.zone_status.unwrap(),
+                        },
+                    )
+                    .await;
+                }
+                Message::StringDescriptionRequest(StringDescriptionRequest { ty, num }) => {
+                    let names = state.names(ty).unwrap();
+                    let mut i = num as usize - 1;
+                    while i < names.len() && names[i].unwrap().is_empty() {
+                        i += 1;
+                    }
+                    let (num, text) = if i == names.len() {
+                        (0, TextDescription::default())
+                    } else {
+                        (i as u8 + 1, names[i].unwrap())
+                    };
+                    send(conn, &StringDescriptionResponse { ty, num, text }).await;
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[tokio::test]
     async fn init() {
         let (client, mut server) = socketpair().await;
 
-        let arming_status = [ArmingStatus::Disarmed; NUM_AREAS];
-        let up_state = [ArmUpState::NotReadyToArm; NUM_AREAS];
-        let alarm_state = [AlarmState::NoAlarmActive; NUM_AREAS];
-        let mut zones = [ZoneStatus::default(); NUM_ZONES];
-        zones[0] = ZoneStatus::new(
+        let mut state = PanelState {
+            arming_status: Some(ArmingStatusReport {
+                arming_status: [ArmingStatus::Disarmed; NUM_AREAS],
+                up_state: [ArmUpState::NotReadyToArm; NUM_AREAS],
+                alarm_state: [AlarmState::NoAlarmActive; NUM_AREAS],
+            }),
+            zone_status: Some([ZoneStatus::default(); NUM_ZONES]),
+            zone_names: [Some(TextDescription::default()); NUM_ZONES],
+            area_names: [Some(TextDescription::default()); NUM_AREAS],
+        };
+        state.zone_names[1] = Some(TextDescription::new("front door").unwrap());
+        state.zone_status.as_mut().unwrap()[0] = ZoneStatus::new(
             crate::msg::ZoneLogicalStatus::Normal,
             crate::msg::ZonePhysicalStatus::EOL,
         );
-
-        let (client, _) = tokio::join!(
-            async { Panel::with_connection(client).await.unwrap() },
-            async {
-                send_ascii(&mut server, "XK384014409022200000").await;
-                let pkt = next_msg(&mut server).await;
-                assert_eq!(pkt, ArmingStatusRequest {}.into());
-                send(
-                    &mut server,
-                    &ArmingStatusReport {
-                        arming_status,
-                        up_state,
-                        alarm_state,
-                    },
-                )
-                .await;
-                let pkt = next_msg(&mut server).await;
-                assert_eq!(pkt, ZoneStatusRequest {}.into());
-                send(&mut server, &ZoneStatusReport { zones }).await;
-                for area in 1..=NUM_AREAS as u8 {
-                    let pkt = next_msg(&mut server).await;
-                    assert_eq!(
-                        pkt,
-                        StringDescriptionRequest {
-                            ty: TextDescriptionType::Area,
-                            num: area,
-                        }
-                        .into()
-                    );
-                    send(
-                        &mut server,
-                        &StringDescriptionResponse {
-                            ty: crate::msg::TextDescriptionType::Area,
-                            num: area,
-                            text: TextDescription::new("home").unwrap(),
-                        },
-                    )
-                    .await;
-                }
-            }
-        );
-
-        assert_eq!(&client.zone_status().unwrap()[..], &zones[..]);
+        let (_, client_state) = tokio::join!(serve_init(&mut server, &state), async {
+            Panel::with_connection(client).await.unwrap().state
+        },);
+        assert_eq!(client_state, state);
     }
 }
