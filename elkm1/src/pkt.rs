@@ -225,7 +225,7 @@ impl AsciiPacket {
     }
 
     /// Decodes an uppercase ASCII hexadigit into `[0, 16)` or returns `Err`.
-    fn dehex_nibble(nibble: u8) -> Result<u8, ()> {
+    pub(crate) fn dehex_nibble(nibble: u8) -> Result<u8, ()> {
         match nibble {
             b'0'..=b'9' => Ok(nibble - b'0'),
             b'A'..=b'F' => Ok(nibble - b'A' + 10),
@@ -238,17 +238,27 @@ impl AsciiPacket {
         Ok(Self::dehex_nibble(high_nibble)? << 4 | Self::dehex_nibble(low_nibble)?)
     }
 
-    /// Encodes a `u8` into two uppercase ASCII hexadigits.
-    fn hex_byte(byte: u8) -> [u8; 2] {
+    /// Encodes the less significant nibble of `nibble` into an ASCII hexadigit.
+    pub(crate) fn hex_nibble(nibble: u8) -> u8 {
         #[rustfmt::skip]
         const HEX_CHARS: [u8; 16] = [
             b'0', b'1', b'2', b'3', b'4', b'5', b'6', b'7',
             b'8', b'9', b'A', b'B', b'C', b'D', b'E', b'F',
         ];
-        [
-            HEX_CHARS[usize::from(byte >> 4)],
-            HEX_CHARS[usize::from(byte & 0xF)],
-        ]
+        HEX_CHARS[usize::from(nibble & 0xF)]
+    }
+
+    /// Encodes a `u8` into two uppercase ASCII hexadigits.
+    fn hex_byte(byte: u8) -> [u8; 2] {
+        [Self::hex_nibble(byte >> 4), Self::hex_nibble(byte)]
+    }
+
+    /// Checks that `data` contains only printable ASCII characters.
+    pub(crate) fn check_printable(value: &[u8]) -> Result<(), String> {
+        if let Some(i) = value.iter().position(|&b| b < 0x20 || b > 0x7e) {
+            return Err(format!("non-printable character at index {}", i));
+        }
+        Ok(())
     }
 }
 
@@ -257,12 +267,7 @@ impl std::convert::TryFrom<Vec<u8>> for AsciiPacket {
 
     #[inline(never)]
     fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
-        if let Some(i) = value.iter().position(|&b| b < 0x20 || b > 0x7e) {
-            return Err(format!(
-                "ASCII packet body has non-printable character at index {}",
-                i
-            ));
-        }
+        Self::check_printable(&value)?;
         // SAFETY: printable ASCII => valid UTF-8.
         let value = unsafe { String::from_utf8_unchecked(value) };
         if value.len() < 2 || value.len() > 253 {

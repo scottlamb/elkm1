@@ -9,7 +9,7 @@ use std::{
 };
 
 use bytes::BytesMut;
-use futures::{Sink, Stream, StreamExt};
+use futures::{Sink, SinkExt, Stream, StreamExt};
 //use futures::{Sink, SinkExt, Stream, StreamExt};
 use tokio::net::{TcpStream, ToSocketAddrs};
 //use tokio::io::unix::AsyncFd;
@@ -35,35 +35,35 @@ impl Stream for Connection {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.0.poll_next_unpin(cx).map_err(|_e| todo!())
+        self.0.poll_next_unpin(cx)
     }
 }
 
 impl Sink<Packet> for Connection {
     type Error = std::io::Error;
     fn poll_ready(
-        self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
     ) -> Poll<Result<(), <Self as Sink<Packet>>::Error>> {
-        todo!()
+        self.0.poll_ready_unpin(cx)
     }
     fn start_send(
-        self: Pin<&mut Self>,
-        _: Packet,
+        mut self: Pin<&mut Self>,
+        item: Packet,
     ) -> Result<(), <Self as futures::Sink<Packet>>::Error> {
-        todo!()
+        self.0.start_send_unpin(item)
     }
     fn poll_flush(
-        self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
     ) -> Poll<Result<(), <Self as Sink<Packet>>::Error>> {
-        todo!()
+        self.0.poll_flush_unpin(cx)
     }
     fn poll_close(
-        self: Pin<&mut Self>,
-        _: &mut Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
     ) -> Poll<Result<(), <Self as Sink<Packet>>::Error>> {
-        todo!()
+        self.0.poll_flush_unpin(cx)
     }
 }
 
@@ -84,5 +84,23 @@ impl tokio_util::codec::Encoder<Packet> for Codec {
     fn encode(&mut self, item: Packet, dst: &mut BytesMut) -> Result<(), Self::Error> {
         item.encode(dst);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod testutil {
+    use super::*;
+
+    /// Cross-platform, tokio equivalent of `socketpair(2)`.
+    pub(crate) async fn socketpair() -> (Connection, Connection) {
+        // Another process on the machine could connect to the server and mess
+        // this up, but that's unlikely enough to ignore in test code.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server = listener.accept().await.unwrap().0;
+        let client = Connection(Framed::new(client, Codec));
+        let server = Connection(Framed::new(server, Codec));
+        (client, server)
     }
 }

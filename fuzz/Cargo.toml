@@ -14,19 +14,26 @@ libfuzzer-sys = "0.4"
 
 [dependencies.elkm1]
 path = "../elkm1"
+features = ["arbitrary"]
 
 # Prevent this from interfering with workspaces
 [workspace]
 members = ["."]
 
 [[bin]]
-name = "encode"
-path = "fuzz_targets/encode.rs"
+name = "pkt"
+path = "fuzz_targets/pkt.rs"
 test = false
 doc = false
 
 [[bin]]
-name = "parse"
-path = "fuzz_targets/parse.rs"
+name = "depkt"
+path = "fuzz_targets/depkt.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "msg"
+path = "fuzz_targets/msg.rs"
 test = false
 doc = false

@@ -8,4 +8,8 @@ pub mod pkt;
 
 #[cfg_attr(docsrs, doc(cfg(feature = doc_cfg)))]
 #[cfg(feature = "tokio")]
+pub mod state;
+
+#[cfg_attr(docsrs, doc(cfg(feature = doc_cfg)))]
+#[cfg(feature = "tokio")]
 pub mod tokio;
