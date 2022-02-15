@@ -105,6 +105,7 @@ messages! {
         pub arming_status: [ArmingStatus; NUM_AREAS],
         pub up_state: [ArmUpState; NUM_AREAS],
         pub alarm_state: [AlarmState; NUM_AREAS],
+        pub first_exit_time: u8,
     }
 
     /// `EE`: Send Entry/Exit Time Data.
@@ -147,7 +148,7 @@ messages! {
     struct ZoneStatusRequest {}
 
     /// `ZS`: Zone Status Report.
-    #[derive(Clone, PartialEq, Eq)]
+    #[derive(Copy, Clone, PartialEq, Eq)]
     struct ZoneStatusReport {
         pub zones: [ZoneStatus; NUM_ZONES],
     }
@@ -166,20 +167,7 @@ impl Message {
         if pkt.len() < 4 {
             return Err(Error("malformed ASCII message: too short".into()));
         }
-        let (cmd, rest) = pkt.split_at(2);
-
-        // The "00" bytes are apparently mandatory. Even when the data is
-        // extended (as "EE" was), new bytes are added before the "00".
-        // The "00"s get in the way of checking lengths for the new fields, so
-        // remove them now.
-        let data = match rest.strip_suffix("00") {
-            Some(d) => d,
-            None => {
-                return Err(Error(
-                    "malformed ASCII message: missing reserved bytes".into(),
-                ))
-            }
-        };
+        let (cmd, data) = pkt.split_at(2);
         match cmd {
             "as" => ArmingStatusRequest::from_ascii_data(data).map(Self::ArmingStatusRequest),
             "AS" => ArmingStatusReport::from_ascii_data(data).map(Self::ArmingStatusReport),
@@ -376,8 +364,8 @@ limited_u8! {
 
 impl SendTimeData {
     fn from_ascii_data(data: &str) -> Result<Self, String> {
-        if data.len() < 8 {
-            return Err(format!("expected at least 8 bytes, got {}", data.len()));
+        if data.len() < 10 {
+            return Err(format!("expected at least 10 bytes, got {}", data.len()));
         }
         let area = match data.as_bytes()[0] {
             b @ b'1'..=b'8' => Area(b - b'0'),
@@ -386,12 +374,12 @@ impl SendTimeData {
         let ty = TimeDataType::try_from(data.as_bytes()[1])?;
         let timer1 = parse_u8_dec("timer1", &data[2..5])?;
         let timer2 = parse_u8_dec("timer2", &data[5..8])?;
-        let armed_state = data
-            .as_bytes()
-            .get(8)
-            .copied()
-            .map(ArmedState::try_from)
-            .transpose()?;
+        let bytes = data.as_bytes();
+        let armed_state = if bytes.len() < 11 {
+            None
+        } else {
+            Some(ArmedState::try_from(bytes[8])?)
+        };
         Ok(SendTimeData {
             area,
             ty,
@@ -432,7 +420,9 @@ impl std::fmt::Debug for ZoneStatus {
 }
 
 impl ZoneStatus {
-    pub fn new(logical: ZoneLogicalStatus, physical: ZonePhysicalStatus) -> Self {
+    pub const UNCONFIGURED: ZoneStatus = ZoneStatus(0);
+
+    pub const fn new(logical: ZoneLogicalStatus, physical: ZonePhysicalStatus) -> Self {
         ZoneStatus((logical as u8) << 2 | (physical as u8))
     }
 
@@ -534,6 +524,10 @@ impl ZoneStatusRequest {
 pub const NUM_ZONES: usize = 208;
 
 impl ZoneStatusReport {
+    pub const ALL_UNCONFIGURED: ZoneStatusReport = ZoneStatusReport {
+        zones: [ZoneStatus::UNCONFIGURED; 208],
+    };
+
     fn from_ascii_data(data: &str) -> Result<Self, String> {
         let args = data.as_bytes();
         if args.len() < NUM_ZONES {
@@ -641,11 +635,18 @@ byte_enum! {
 
 pub const NUM_AREAS: usize = 8;
 
+impl ArmingStatus {
+    fn has_entry_delay(self) -> bool {
+        use ArmingStatus::*;
+        matches!(self, ArmedAway | ArmedStay | ArmedNight | ArmedVacation)
+    }
+}
+
 impl ArmingStatusReport {
     fn from_ascii_data(data: &str) -> Result<Self, String> {
         let data = data.as_bytes();
-        if data.len() < 3 * NUM_AREAS {
-            return Err(format!("expected at least {} bytes", 3 * NUM_AREAS));
+        if data.len() < 26 {
+            return Err(format!("expected at least {} data", 26));
         }
         let mut arming_status = [ArmingStatus::Disarmed; NUM_AREAS];
         let mut up_state = [ArmUpState::ReadyToArm; NUM_AREAS];
@@ -655,27 +656,48 @@ impl ArmingStatusReport {
             up_state[i] = ArmUpState::try_from(data[NUM_AREAS + i])?;
             alarm_state[i] = AlarmState::try_from(data[2 * NUM_AREAS + i])?;
         }
+        let first_exit_time =
+            AsciiPacket::dehex_byte(data[24], data[25]).map_err(|()| "bad first_exit_time")?;
         Ok(ArmingStatusReport {
             arming_status,
             up_state,
             alarm_state,
+            first_exit_time,
         })
     }
     pub fn to_ascii(&self) -> AsciiPacket {
-        //let msg = Vec::with_capacity(4 + 3 * NUM_AREAS);
-        //msg.extend(b"AS");
         let msg: Vec<_> = b"AS"
             .iter()
             .copied()
             .chain(self.arming_status.iter().map(|&v| v as u8))
             .chain(self.up_state.iter().map(|&v| v as u8))
             .chain(self.alarm_state.iter().map(|&v| v as u8))
-            .chain(b"00".iter().copied())
+            .chain(AsciiPacket::hex_byte(self.first_exit_time).iter().copied())
             .collect();
         AsciiPacket::try_from(msg).expect("ArmingStatusResponse valid ascii")
     }
     pub fn is_reply_to(&self, request: &Message) -> bool {
         matches!(request, Message::ArmingStatusRequest(_))
+    }
+
+    /// Checks if a `from`->`to` transition is likely to be spurious.
+    ///
+    /// See [this thread](https://www.elkproducts.com/forums/topic/spurious-armed-fully-message/).
+    pub fn is_transition_suspicious(from: &ArmingStatusReport, to: &ArmingStatusReport) -> bool {
+        for ((f_s, t_s), t_u) in from
+            .arming_status
+            .iter()
+            .zip(to.arming_status.iter())
+            .zip(to.up_state.iter())
+        {
+            if *f_s == ArmingStatus::Disarmed
+                && t_s.has_entry_delay()
+                && *t_u == ArmUpState::ArmedFully
+            {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -728,6 +750,8 @@ impl StringDescriptionRequest {
 pub struct TextDescription([u8; 16]);
 
 impl TextDescription {
+    pub const EMPTY: TextDescription = TextDescription(*b"                ");
+
     /// Uses up to 16 bytes of `text`, which must be ASCII printable characters.
     pub fn new(text: &str) -> Result<Self, String> {
         AsciiPacket::check_printable(text.as_bytes())?;
@@ -748,6 +772,34 @@ impl TextDescription {
 
     pub fn is_empty(&self) -> bool {
         self.0[0] == b' '
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub struct TextDescriptions<const N: usize>(pub [TextDescription; N]);
+
+impl<const N: usize> TextDescriptions<N> {
+    pub const ALL_EMPTY: TextDescriptions<N> = TextDescriptions([TextDescription::EMPTY; N]);
+}
+
+impl<const N: usize> std::ops::Index<usize> for TextDescriptions<N> {
+    type Output = TextDescription;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.0[index]
+    }
+}
+
+impl<const N: usize> std::fmt::Debug for TextDescriptions<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.0.iter().enumerate().filter_map(|(i, d)| {
+                if d.is_empty() {
+                    return None;
+                }
+                Some((i + 1, d))
+            }))
+            .finish()
     }
 }
 
@@ -843,8 +895,46 @@ impl StringDescriptionResponse {
 mod tests {
     use super::*;
 
+    /*#[test]
+    fn valid_as_report_without_timer() {
+
+    }*/
+
     #[test]
-    fn valid_ee_report() {
+    fn valid_as_report_with_timer() {
+        let mut expected = ArmingStatusReport {
+            arming_status: [ArmingStatus::Disarmed; NUM_AREAS],
+            up_state: [ArmUpState::ReadyToArm; NUM_AREAS],
+            alarm_state: [AlarmState::NoAlarmActive; NUM_AREAS],
+            first_exit_time: 59,
+        };
+        expected.arming_status[0] = ArmingStatus::ArmedStay;
+        expected.up_state[0] = ArmUpState::ArmedWithExitTimer;
+        let pkt = Packet::Ascii(AsciiPacket::try_from("AS2000000031111111000000003B").unwrap());
+        let msg = Message::parse(&pkt).unwrap().unwrap();
+        assert_eq!(msg, Message::ArmingStatusReport(expected));
+        assert_eq!(msg.to_pkt(), pkt);
+    }
+
+    #[test]
+    fn valid_old_ee_report() {
+        let pkt = Packet::Ascii(AsciiPacket::try_from("EE1103000000").unwrap());
+        let msg = Message::parse(&pkt).unwrap().unwrap();
+        assert_eq!(
+            msg,
+            Message::SendTimeData(SendTimeData {
+                area: Area::try_from(1).unwrap(),
+                ty: TimeDataType::Entry,
+                timer1: 30,
+                timer2: 0,
+                armed_state: None,
+            })
+        );
+        assert_eq!(msg.to_pkt(), pkt);
+    }
+
+    #[test]
+    fn valid_new_ee_report() {
         let pkt = Packet::Ascii(AsciiPacket::try_from("EE11030000100").unwrap());
         let msg = Message::parse(&pkt).unwrap().unwrap();
         assert_eq!(
@@ -901,5 +991,33 @@ mod tests {
             })
         );
         assert_eq!(msg.to_pkt(), pkt);
+    }
+
+    #[test]
+    fn suspicious() {
+        let disarmed = ArmingStatusReport {
+            arming_status: [ArmingStatus::Disarmed; NUM_AREAS],
+            up_state: [ArmUpState::ReadyToArm; NUM_AREAS],
+            alarm_state: [AlarmState::NoAlarmActive; NUM_AREAS],
+            first_exit_time: 0,
+        };
+        let mut arming = disarmed;
+        arming.arming_status[0] = ArmingStatus::ArmedStay;
+        arming.up_state[0] = ArmUpState::ArmedWithExitTimer;
+        let mut armed = disarmed;
+        armed.arming_status[0] = ArmingStatus::ArmedStay;
+        armed.up_state[0] = ArmUpState::ArmedFully;
+        assert!(!ArmingStatusReport::is_transition_suspicious(
+            &disarmed, &arming
+        ));
+        assert!(ArmingStatusReport::is_transition_suspicious(
+            &disarmed, &armed
+        ));
+        assert!(!ArmingStatusReport::is_transition_suspicious(
+            &arming, &armed
+        ));
+        assert!(!ArmingStatusReport::is_transition_suspicious(
+            &armed, &disarmed
+        ));
     }
 }

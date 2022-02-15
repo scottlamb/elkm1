@@ -47,20 +47,32 @@
 
 use std::pin::Pin;
 use std::task::Poll;
+use std::time::Duration;
 
-use futures::{Sink, SinkExt, Stream, StreamExt};
+use futures::{Future, Sink, SinkExt, Stream, StreamExt};
 use tokio::net::ToSocketAddrs;
+use tokio::time::Sleep;
 
 use crate::msg::{
     ArmingStatusReport, ArmingStatusRequest, Message, StringDescriptionRequest, TextDescription,
-    TextDescriptionType, Zone, ZoneStatus, ZoneStatusRequest, NUM_AREAS, NUM_ZONES,
+    TextDescriptionType, TextDescriptions, Zone, ZoneStatus, ZoneStatusReport, ZoneStatusRequest,
+    NUM_AREAS, NUM_ZONES,
 };
 use crate::pkt::Packet;
 use crate::tokio::Connection;
 
+/// Delay in applying an `ArmingReport` transition suspected of being spurious.
+///
+/// The Elk appears to follow these spurious reports with correct ones almost
+/// immediately. The generous delay here is in case something else in the
+/// system goes out to lunch at a bad time: the Elk M1XEP, the network,
+/// the local process (not polling the `Panel` promptly), etc.
+const SUSPICIOUS_TRANSITION_DELAY: Duration = Duration::from_secs(5);
+
 pub struct Panel {
     conn: Connection,
     state: PanelState,
+    pending_arm: Option<(Pin<Box<Sleep>>, ArmingStatusReport)>,
 }
 
 impl Panel {
@@ -75,14 +87,23 @@ impl Panel {
     }
 
     pub fn zone_name(&self, zone: Zone) -> &TextDescription {
-        self.state.zone_names[zone.to_index()]
-            .as_ref()
-            .expect("zone_name is set post-init")
+        &self.state.zone_names.0[zone.to_index()]
     }
 
-    pub fn zone_status(&self) -> &[ZoneStatus; NUM_ZONES] {
+    pub fn area_names(&self) -> &TextDescriptions<NUM_AREAS> {
+        &self.state.area_names
+    }
+
+    pub fn arming_status(&self) -> &ArmingStatusReport {
         self.state
-            .zone_status
+            .arming_status
+            .as_ref()
+            .expect("arming_status is set post-init")
+    }
+
+    pub fn zone_statuses(&self) -> &ZoneStatusReport {
+        self.state
+            .zone_statuses
             .as_ref()
             .expect("zone_status is set post-init")
     }
@@ -91,6 +112,7 @@ impl Panel {
         let mut this = Panel {
             conn,
             state: PanelState::default(),
+            pending_arm: None,
         };
         this.init_req(ArmingStatusRequest {}.into()).await?;
         this.init_req(ZoneStatusRequest {}.into()).await?;
@@ -147,19 +169,11 @@ impl Panel {
                 i as usize
             } else {
                 // no remaining non-empty names.
-                for j in unfilled_i..max {
-                    names[j] = Some(TextDescription::default());
-                }
                 return Ok(());
             };
-            debug_assert!(reply_i >= unfilled_i); // checked by SDR::is_reply_to also.
-            while unfilled_i < reply_i {
-                // skipped empty names.
-                names[unfilled_i] = Some(TextDescription::default());
-                unfilled_i += 1;
-            }
-            names[unfilled_i] = Some(reply.text);
-            unfilled_i += 1;
+            assert!(reply_i >= unfilled_i); // checked by SDR::is_reply_to also.
+            names[reply_i] = reply.text;
+            unfilled_i = reply_i + 1;
         }
         Ok(())
     }
@@ -171,17 +185,12 @@ impl Panel {
         if let Some(Ok(m)) = &msg {
             match m {
                 Message::ArmingStatusReport(m) => {
-                    if let Some(ref prior) = self.state.arming_status {
-                        if prior != m {
-                            change = Some(Change::ArmingStatus(*prior));
-                        }
-                    }
-                    self.state.arming_status = Some(*m);
+                    change = self.interpret_arming_status(m);
                 }
                 //Message::SendTimeData(_) => todo!(),
                 Message::ZoneChange(m) => {
-                    if let Some(ref mut s) = self.state.zone_status {
-                        let s = &mut s[m.zone.to_index()];
+                    if let Some(ref mut s) = self.state.zone_statuses {
+                        let s = &mut s.zones[m.zone.to_index()];
                         if *s != m.status {
                             change = Some(Change::ZoneChange {
                                 zone: m.zone,
@@ -192,12 +201,61 @@ impl Panel {
                     }
                 }
                 Message::ZoneStatusReport(m) => {
-                    self.state.zone_status = Some(m.zones);
+                    self.state.zone_statuses = Some(*m);
                 }
                 _ => {}
             }
         }
-        Event { pkt, msg, change }
+        Event {
+            pkt: Some(pkt),
+            msg,
+            change,
+        }
+    }
+
+    fn interpret_arming_status(&mut self, msg: &ArmingStatusReport) -> Option<Change> {
+        let prior = match self.state.arming_status {
+            None => {
+                self.state.arming_status = Some(*msg);
+                return None;
+            }
+            Some(ref s) => s,
+        };
+
+        // When arming with a timer, the Elk appears to sends a spurious "fully
+        // armed" message then corrects it, as described in this thread:
+        // <https://www.elkproducts.com/forums/topic/spurious-armed-fully-message/>.
+        // Hold on to that message, and only apply it if there isn't another
+        // transition within a reasonable time.
+        if let Some((_, pending)) = self.pending_arm.take() {
+            if ArmingStatusReport::is_transition_suspicious(prior, msg) {
+                log::warn!(
+                    "next arming report after suspicious transition is also suspicious; \
+                     applying anyway\nprior: {:#?}\npending: {:#?}\nnew: {:#?}",
+                    prior,
+                    &pending,
+                    &msg,
+                );
+            }
+        } else if ArmingStatusReport::is_transition_suspicious(prior, msg) {
+            log::debug!(
+                "Delaying arming status transition suspected to be spurious.\n\
+                 prior: {:#?}\npending: {:#?}",
+                prior,
+                msg,
+            );
+            self.pending_arm = Some((
+                Box::pin(tokio::time::sleep(SUSPICIOUS_TRANSITION_DELAY)),
+                *msg,
+            ));
+            return None;
+        }
+        if prior != msg {
+            let prior = *prior;
+            self.state.arming_status = Some(*msg);
+            return Some(Change::ArmingStatus { prior });
+        }
+        None
     }
 }
 
@@ -205,7 +263,7 @@ impl Stream for Panel {
     type Item = Result<Event, std::io::Error>;
 
     fn poll_next(
-        self: std::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = Pin::into_inner(self);
@@ -218,6 +276,29 @@ impl Stream for Panel {
                 return Poll::Ready(Some(Ok(event)));
             }
             Poll::Pending => {}
+        }
+
+        if let Some((s, a)) = this.pending_arm.as_mut() {
+            if s.as_mut().poll(cx).is_ready() {
+                let prior = this
+                    .state
+                    .arming_status
+                    .expect("have prior arming_status when transition pending");
+                let event = Event {
+                    pkt: None,
+                    msg: None,
+                    change: Some(Change::ArmingStatus { prior }),
+                };
+                log::warn!(
+                    "Deferred arming status taking effect.\n\
+                     prior: {:?}\npending: {:?}\n",
+                    prior,
+                    a,
+                );
+                this.state.arming_status = Some(*a);
+                this.pending_arm.take();
+                return Poll::Ready(Some(Ok(event)));
+            }
         }
 
         // TODO: send anything that needs to be sent...
@@ -259,27 +340,27 @@ impl Sink<Command> for Panel {
 #[derive(Debug, Eq, PartialEq)]
 struct PanelState {
     arming_status: Option<ArmingStatusReport>,
-    zone_status: Option<[ZoneStatus; NUM_ZONES]>,
-    zone_names: [Option<TextDescription>; NUM_ZONES],
-    area_names: [Option<TextDescription>; NUM_AREAS],
+    zone_statuses: Option<ZoneStatusReport>,
+    zone_names: TextDescriptions<NUM_ZONES>,
+    area_names: TextDescriptions<NUM_AREAS>,
 }
 
 impl PanelState {
     /// Returns a const reference to the given names, if valid/understood.
     #[cfg(test)]
-    fn names(&self, ty: TextDescriptionType) -> Option<&[Option<TextDescription>]> {
+    fn names(&self, ty: TextDescriptionType) -> Option<&[TextDescription]> {
         Some(match ty {
-            TextDescriptionType::Area => &self.area_names[..],
-            TextDescriptionType::Zone => &self.zone_names[..],
+            TextDescriptionType::Area => &self.area_names.0[..],
+            TextDescriptionType::Zone => &self.zone_names.0[..],
             _ => return None,
         })
     }
 
     /// Returns a mutable reference to the given names, if valid/understood.
-    fn names_mut(&mut self, ty: TextDescriptionType) -> Option<&mut [Option<TextDescription>]> {
+    fn names_mut(&mut self, ty: TextDescriptionType) -> Option<&mut [TextDescription]> {
         Some(match ty {
-            TextDescriptionType::Area => &mut self.area_names[..],
-            TextDescriptionType::Zone => &mut self.zone_names[..],
+            TextDescriptionType::Area => &mut self.area_names.0[..],
+            TextDescriptionType::Zone => &mut self.zone_names.0[..],
             _ => return None,
         })
     }
@@ -290,16 +371,16 @@ impl Default for PanelState {
     fn default() -> Self {
         Self {
             arming_status: None,
-            zone_status: None,
-            zone_names: [None; NUM_ZONES],
-            area_names: [None; NUM_AREAS],
+            zone_statuses: None,
+            zone_names: TextDescriptions::ALL_EMPTY,
+            area_names: TextDescriptions::ALL_EMPTY,
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct Event {
-    pub pkt: crate::pkt::Packet,
+    pub pkt: Option<crate::pkt::Packet>,
     pub msg: Option<Result<crate::msg::Message, crate::msg::Error>>,
     pub change: Option<Change>,
 }
@@ -312,13 +393,13 @@ pub struct Event {
 /// if the caller wishes to learn exactly what changed in this message, it
 /// should compare them *before* calling `<Panel as futures::Stream>::poll_next`
 /// again, so that no other messages are included in the diff.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Change {
     /// Received a `ZC` which does not match the zone's known prior state.
     ZoneChange { zone: Zone, prior: ZoneStatus },
 
     /// Received a `AS` which does not match the prior arming state.
-    ArmingStatus(ArmingStatusReport),
+    ArmingStatus { prior: ArmingStatusReport },
 }
 
 #[derive(Clone, Debug)]
@@ -367,24 +448,18 @@ mod tests {
                     send(conn, state.arming_status.as_ref().unwrap()).await;
                 }
                 Message::ZoneStatusRequest(_) => {
-                    send(
-                        conn,
-                        &ZoneStatusReport {
-                            zones: state.zone_status.unwrap(),
-                        },
-                    )
-                    .await;
+                    send(conn, state.zone_statuses.as_ref().unwrap()).await;
                 }
                 Message::StringDescriptionRequest(StringDescriptionRequest { ty, num }) => {
                     let names = state.names(ty).unwrap();
                     let mut i = num as usize - 1;
-                    while i < names.len() && names[i].unwrap().is_empty() {
+                    while i < names.len() && names[i].is_empty() {
                         i += 1;
                     }
                     let (num, text) = if i == names.len() {
                         (0, TextDescription::default())
                     } else {
-                        (i as u8 + 1, names[i].unwrap())
+                        (i as u8 + 1, names[i])
                     };
                     send(conn, &StringDescriptionResponse { ty, num, text }).await;
                 }
@@ -402,13 +477,14 @@ mod tests {
                 arming_status: [ArmingStatus::Disarmed; NUM_AREAS],
                 up_state: [ArmUpState::NotReadyToArm; NUM_AREAS],
                 alarm_state: [AlarmState::NoAlarmActive; NUM_AREAS],
+                first_exit_time: 0,
             }),
-            zone_status: Some([ZoneStatus::default(); NUM_ZONES]),
-            zone_names: [Some(TextDescription::default()); NUM_ZONES],
-            area_names: [Some(TextDescription::default()); NUM_AREAS],
+            zone_statuses: Some(ZoneStatusReport::ALL_UNCONFIGURED),
+            zone_names: TextDescriptions::ALL_EMPTY,
+            area_names: TextDescriptions::ALL_EMPTY,
         };
-        state.zone_names[1] = Some(TextDescription::new("front door").unwrap());
-        state.zone_status.as_mut().unwrap()[0] = ZoneStatus::new(
+        state.zone_names.0[1] = TextDescription::new("front door").unwrap();
+        state.zone_statuses.as_mut().unwrap().zones[0] = ZoneStatus::new(
             crate::msg::ZoneLogicalStatus::Normal,
             crate::msg::ZonePhysicalStatus::EOL,
         );
@@ -416,5 +492,119 @@ mod tests {
             Panel::with_connection(client).await.unwrap().state
         },);
         assert_eq!(client_state, state);
+    }
+
+    struct Activity {
+        msg: &'static str,
+        checker: fn(&Event, &Panel),
+    }
+
+    async fn follow_activities(
+        activities: &[Activity],
+        panel: &mut Panel,
+        server: &mut Connection,
+    ) {
+        for a in activities {
+            tokio::join!(send_ascii(server, a.msg), async {
+                let event = panel.next().await.unwrap().unwrap();
+                match &event.pkt {
+                    Some(Packet::Ascii(p)) => assert_eq!(&p[..], a.msg),
+                    _ => unreachable!(),
+                }
+                (a.checker)(&event, &panel);
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn follow_arm_with_delay() {
+        let (client, mut server) = socketpair().await;
+        const INITIAL: PanelState = PanelState {
+            arming_status: Some(ArmingStatusReport {
+                arming_status: [ArmingStatus::Disarmed; NUM_AREAS],
+                up_state: [ArmUpState::ReadyToArm; NUM_AREAS],
+                alarm_state: [AlarmState::NoAlarmActive; NUM_AREAS],
+                first_exit_time: 0,
+            }),
+            zone_statuses: Some(ZoneStatusReport::ALL_UNCONFIGURED),
+            zone_names: TextDescriptions::ALL_EMPTY,
+            area_names: TextDescriptions::ALL_EMPTY,
+        };
+
+        let mut panel = Panel {
+            conn: client,
+            state: INITIAL,
+            pending_arm: None,
+        };
+        // t= 0: IC0000000000000010200           2022-02-14T21:54:23Z
+        // t= 0: LD117300111354021400022200
+        // t= 0: AS00000000111111110000000000
+        // t= 0: AM00000000
+        // t= 0: AS20000000411111110000000000
+        // t= 0: AM00000000
+        // t= 0: ZC... (many no-ops)
+        // t= 1: EE10060180200
+        // t= 1: AS2000000031111111000000003B
+        // t= 1: AM00000000
+        // t= 8: XK305413214022200000
+        // t=38: XK305413214022200000
+        // t=59: AS20000000411111110000000000
+        // t=59: AM00000000
+        // t=59: ZC... (many no-ops)
+        // t=99: XK005613214022200000            2022-02-14T21:56:02Z
+        let activities = [
+            Activity {
+                msg: "IC0000000000000010200",
+                checker: |event, _panel| {
+                    assert_eq!(event.change, None);
+                },
+            },
+            Activity {
+                msg: "LD117300111354021400022200",
+                checker: |event, _panel| {
+                    assert_eq!(event.change, None);
+                },
+            },
+            Activity {
+                msg: "AS00000000111111110000000000",
+                checker: |event, panel| {
+                    assert_eq!(event.change, None);
+                    assert!(panel.pending_arm.is_none());
+                },
+            },
+            Activity {
+                msg: "AM00000000",
+                checker: |event, _panel| {
+                    assert_eq!(event.change, None);
+                },
+            },
+            Activity {
+                msg: "AS20000000411111110000000000",
+                checker: |event, panel| {
+                    assert_eq!(panel.state, INITIAL);
+                    assert!(panel.pending_arm.is_some());
+                    assert_eq!(event.change, None);
+                },
+            },
+            Activity {
+                msg: "AM00000000",
+                checker: |event, _panel| {
+                    assert_eq!(event.change, None);
+                },
+            },
+            // t= 0: AS20000000411111110000000000
+            Activity {
+                msg: "AS20000000411111110000000000",
+                checker: |event, panel| {
+                    assert!(matches!(event.change, Some(Change::ArmingStatus { .. })));
+                    assert!(panel.pending_arm.is_none());
+                    assert_eq!(
+                        panel.state.arming_status.unwrap().arming_status[0],
+                        ArmingStatus::ArmedStay
+                    );
+                },
+            },
+        ];
+        follow_activities(&activities, &mut panel, &mut server).await;
     }
 }

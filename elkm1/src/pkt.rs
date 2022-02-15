@@ -234,7 +234,7 @@ impl AsciiPacket {
     }
 
     /// Decodes two uppercase ASCII hexadigits into a `u8` or returns `Err`.
-    fn dehex_byte(high_nibble: u8, low_nibble: u8) -> Result<u8, ()> {
+    pub(crate) fn dehex_byte(high_nibble: u8, low_nibble: u8) -> Result<u8, ()> {
         Ok(Self::dehex_nibble(high_nibble)? << 4 | Self::dehex_nibble(low_nibble)?)
     }
 
@@ -249,7 +249,7 @@ impl AsciiPacket {
     }
 
     /// Encodes a `u8` into two uppercase ASCII hexadigits.
-    fn hex_byte(byte: u8) -> [u8; 2] {
+    pub(crate) fn hex_byte(byte: u8) -> [u8; 2] {
         [Self::hex_nibble(byte >> 4), Self::hex_nibble(byte)]
     }
 

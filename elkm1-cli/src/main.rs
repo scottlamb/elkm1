@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use bytes::BytesMut;
 use clap::Parser;
-use elkm1::state::Change;
+use elkm1::{msg::NUM_AREAS, state::Change};
 use futures::StreamExt;
 use pretty_hex::PrettyHex;
 
@@ -28,8 +28,29 @@ async fn watch(addr: String) {
                     "{}: {:?} -> {:?}",
                     panel.zone_name(zone),
                     prior,
-                    panel.zone_status()[zone.to_index()],
+                    panel.zone_statuses().zones[zone.to_index()],
                 );
+            }
+            Some(Change::ArmingStatus { prior }) => {
+                let cur = panel.arming_status();
+                let area_names = panel.area_names();
+                for i in 0..NUM_AREAS {
+                    if prior.arming_status[i] != cur.arming_status[i]
+                        || prior.up_state[i] != cur.up_state[i]
+                        || prior.alarm_state[i] != cur.alarm_state[i]
+                    {
+                        log::info!(
+                            "{}: {:?} {:?} {:?} -> {:?} {:?} {:?}",
+                            area_names[i],
+                            prior.arming_status[i],
+                            prior.up_state[i],
+                            prior.alarm_state[i],
+                            cur.arming_status[i],
+                            cur.up_state[i],
+                            cur.alarm_state[i],
+                        );
+                    }
+                }
             }
             _ => {}
         }
