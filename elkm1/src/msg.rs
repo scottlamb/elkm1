@@ -7,11 +7,15 @@
 #[cfg(feature = "arbitrary")]
 use arbitrary::Arbitrary;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 use std::str::FromStr;
 
 use crate::pkt::{AsciiPacket, Packet};
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
 pub struct Error(String);
 
 impl std::fmt::Display for Error {
@@ -41,6 +45,11 @@ macro_rules! messages {
     ) => {
         /// A parsed (ASCII) message of any supported type.
         #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
+        #[cfg_attr(
+            feature = "serde",
+            derive(Serialize, Deserialize),
+            serde(rename_all="camelCase"))
+        ]
         #[derive(Clone, Debug, PartialEq, Eq)]
         #[non_exhaustive]
         pub enum Message {
@@ -99,6 +108,7 @@ macro_rules! messages {
 messages! {
     /// `aL`: Arm/Disarm Request.
     #[derive(Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
     struct ArmRequest {
         pub area: Area,
         pub level: ArmLevel,
@@ -107,10 +117,12 @@ messages! {
 
     /// `as`: Arming Status Request.
     #[derive(Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
     struct ArmingStatusRequest {}
 
     /// `AS`: Arming Status Report.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
     struct ArmingStatusReport {
         pub arming_status: [ArmingStatus; NUM_AREAS],
         pub up_state: [ArmUpState; NUM_AREAS],
@@ -120,6 +132,7 @@ messages! {
 
     /// `EE`: Send Entry/Exit Time Data.
     #[derive(Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
     struct SendTimeData {
         pub area: Area,
         pub ty: TimeDataType,
@@ -133,6 +146,7 @@ messages! {
 
     /// `IC`:  Send Valid User Number and Invalid User Code.
     #[derive(Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
     struct SendCode {
         /// The code, or all 0s if it represents a valid user.
         ///
@@ -151,6 +165,7 @@ messages! {
 
     /// `sd`: Request ASCII String Text Descriptions.
     #[derive(Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
     struct StringDescriptionRequest {
         pub ty: TextDescriptionType,
         pub num: u8,
@@ -158,6 +173,7 @@ messages! {
 
     /// `SD`: ASCII String Text Descriptions.
     #[derive(Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
     struct StringDescriptionResponse {
         pub ty: TextDescriptionType,
         pub num: u8,
@@ -166,18 +182,21 @@ messages! {
 
     /// `tn`: Task Activation.
     #[derive(Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
     struct ActivateTask {
         pub task: Task,
     }
 
     /// `TC`: Task Change Update.
     #[derive(Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
     struct TaskChange {
         pub task: Task,
     }
 
     /// `ZC`: Zone Change Update.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
     struct ZoneChange {
         pub zone: Zone,
         pub status: ZoneStatus,
@@ -185,6 +204,7 @@ messages! {
 
     /// `zs`: Zone Status Request.
     #[derive(Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
     struct ZoneStatusRequest {}
 
     /// `ZS`: Zone Status Report.
@@ -253,6 +273,11 @@ macro_rules! byte_enum {
     ) => {
         #[doc=$enum_doc]
         #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
+        #[cfg_attr(
+            feature = "serde",
+            derive(Serialize, Deserialize),
+            serde(rename_all="camelCase"))
+        ]
         #[derive(Copy, Clone, Debug, PartialEq, Eq)]
         #[repr(u8)]
         $vis enum $enum {
@@ -291,6 +316,11 @@ macro_rules! num_enum {
     ) => {
         #[doc=$enum_doc]
         #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
+        #[cfg_attr(
+            feature = "serde",
+            derive(Serialize, Deserialize),
+            serde(rename_all="camelCase"))
+        ]
         #[derive(Copy, Clone, Debug, PartialEq, Eq)]
         #[repr(u8)]
         $vis enum $enum {
@@ -340,6 +370,7 @@ byte_enum! {
 
 /// A six-digit numeric arm code.
 #[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
 pub struct ArmCode([u8; 6]);
 
 impl std::fmt::Debug for ArmCode {
@@ -424,6 +455,7 @@ macro_rules! limited_u8 {
     ) => {
         #[repr(transparent)]
         #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
         pub struct $t(u8);
 
         impl $t {
@@ -546,6 +578,7 @@ impl SendTimeData {
 }
 
 #[derive(Copy, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
 pub struct ZoneStatus(
     /// The decoded hex nibble as a value in \[0, 16\).
     u8,
@@ -695,6 +728,26 @@ impl ZoneStatusReport {
     }
     pub fn is_response_to(&self, request: &Message) -> bool {
         matches!(request, Message::ZoneStatusRequest(_))
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for ZoneStatusReport {
+    fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        todo!()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for ZoneStatusReport {
+    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        todo!()
     }
 }
 
@@ -946,6 +999,7 @@ impl StringDescriptionRequest {
 
 /// A 16-byte printable ASCII description, with spaces used as trailing padding.
 #[derive(Copy, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
 pub struct TextDescription([u8; 16]);
 
 impl TextDescription {

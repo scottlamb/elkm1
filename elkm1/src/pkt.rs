@@ -6,6 +6,9 @@
 use bytes::{Buf as _, BufMut, BytesMut};
 use pretty_hex::PrettyHex as _;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 const RP_HEADER: [u8; 2] = [0x10, 0x02];
 const RP_FOOTER: [u8; 2] = [0x10, 0x03];
 
@@ -14,6 +17,11 @@ const RP_FOOTER: [u8; 2] = [0x10, 0x03];
 /// It's guaranteed that any decoded sequence of packets encodes into exactly the same bytes,
 /// or vice versa.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(rename_all = "camelCase")
+)]
 pub enum Packet {
     Ascii(AsciiPacket),
     Rp(RpPacket),
@@ -103,6 +111,11 @@ impl From<InvalidPacket> for Packet {
 
 /// Bytes that don't necessarily represent a valid packet.
 #[derive(Clone)]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(rename_all = "camelCase")
+)]
 pub struct InvalidPacket {
     reason: String,
     raw: Vec<u8>,
@@ -186,6 +199,7 @@ impl PartialEq for InvalidPacket {
 ///
 /// To decode a framed packet, see [`Packet::decode`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
 pub struct AsciiPacket(String);
 
 impl AsciiPacket {
@@ -336,6 +350,7 @@ impl std::ops::Deref for AsciiPacket {
 ///
 /// To decode a framed packet, see [`Packet::decode`].
 #[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
 pub struct RpPacket(Vec<u8>);
 
 impl RpPacket {

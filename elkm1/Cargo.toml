@@ -19,6 +19,7 @@ futures = "0.3.14"
 log = "0.4.14"
 memchr = "2.4.1"
 pretty-hex = "0.2.1"
+serde = { version  = "1.0.136", features = ["derive"], optional = true }
 tokio = { version = "1.16.1", features = ["net", "time"], optional = true }
 tokio-util = { version = "0.6.6", features = ["codec"], optional = true }
 
@@ -26,6 +27,7 @@ tokio-util = { version = "0.6.6", features = ["codec"], optional = true }
 pretty_assertions = "1.1.0"
 tokio = { version = "1.16.1", features = ["macros", "rt", "net", "time"] }
 
+# See crate-level doc comment for a description of features.
 [features]
 default = ["tokio"]
 tokio = ["dep:tokio", "dep:tokio-util"]

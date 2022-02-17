@@ -72,6 +72,10 @@ use std::task::{Poll, Waker};
 use std::time::Duration;
 
 use futures::{Future, Sink, SinkExt, Stream, StreamExt};
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 use tokio::net::ToSocketAddrs;
 use tokio::time::Sleep;
 
@@ -464,6 +468,11 @@ impl Default for PanelState {
     }
 }
 
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(rename_all = "camelCase")
+)]
 #[derive(Clone, Debug)]
 pub struct Event {
     pub pkt: Option<pkt::Packet>,
@@ -483,6 +492,11 @@ pub struct Event {
 /// should compare them *before* calling `<Panel as futures::Stream>::poll_next`
 /// again, so that no other messages are included in the diff.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(rename_all = "camelCase")
+)]
 pub enum Change {
     /// Received a `ZC` which does not match the zone's known prior state.
     ZoneChange {

@@ -2,4 +2,5 @@
 members = [
     "elkm1",
     "elkm1-cli",
+    "elkm1-mqtt",
 ]
