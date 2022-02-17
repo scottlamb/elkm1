@@ -164,6 +164,18 @@ messages! {
         pub text: TextDescription,
     }
 
+    /// `tn`: Task Activation.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ActivateTask {
+        pub task: Task,
+    }
+
+    /// `TC`: Task Change Update.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct TaskChange {
+        pub task: Task,
+    }
+
     /// `ZC`: Zone Change Update.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     struct ZoneChange {
@@ -209,6 +221,8 @@ impl Message {
             }
             b"SD" => StringDescriptionResponse::from_ascii_data(data)
                 .map(Self::StringDescriptionResponse),
+            b"tn" => ActivateTask::from_ascii_data(data).map(Self::ActivateTask),
+            b"TC" => TaskChange::from_ascii_data(data).map(Self::TaskChange),
             b"ZC" => ZoneChange::from_ascii_data(data).map(Self::ZoneChange),
             b"zs" => ZoneStatusRequest::from_ascii_data(data).map(Self::ZoneStatusRequest),
             b"ZS" => ZoneStatusReport::from_ascii_data(data).map(Self::ZoneStatusReport),
@@ -465,6 +479,11 @@ macro_rules! limited_u8 {
     };
 }
 
+pub const NUM_AREAS: usize = 8;
+pub const NUM_KEYPADS: usize = 16;
+pub const NUM_TASKS: usize = 32;
+pub const NUM_ZONES: usize = 208;
+
 limited_u8! {
     /// A zone number in the range of `[1, 208]`.
     Zone max=208
@@ -478,6 +497,11 @@ limited_u8! {
 limited_u8! {
     /// A keypad number in the range of `[1, 16]`.
     Keypad max=16
+}
+
+limited_u8! {
+    /// An automation task number in the range of `[1, 32]`.
+    Task max=32
 }
 
 impl SendTimeData {
@@ -641,8 +665,6 @@ impl ZoneStatusRequest {
     }
 }
 
-pub const NUM_ZONES: usize = 208;
-
 impl ZoneStatusReport {
     pub const ALL_UNCONFIGURED: ZoneStatusReport = ZoneStatusReport {
         zones: [ZoneStatus::UNCONFIGURED; 208],
@@ -781,8 +803,6 @@ byte_enum! {
         VerifyFire = b'B',
     }
 }
-
-pub const NUM_AREAS: usize = 8;
 
 impl ArmingStatus {
     fn has_entry_delay(self) -> bool {
@@ -1062,6 +1082,40 @@ impl StringDescriptionResponse {
             // or later.
             if self.ty == *ty && (self.num >= *num || self.num == 0)
         )
+    }
+}
+
+impl ActivateTask {
+    fn from_ascii_data(data: &[u8]) -> Result<Self, String> {
+        if data.len() < 3 {
+            return Err(format!("expected at least 3 bytes, got {}", data.len()));
+        }
+        let task = Task::try_from(parse_u8_dec("task", &data[..3])?)?;
+        Ok(ActivateTask { task })
+    }
+    fn to_ascii(&self) -> AsciiPacket {
+        let msg = format!("tn{:03}00", self.task.0);
+        AsciiPacket::try_from(msg).expect("Task valid")
+    }
+    fn is_response_to(&self, _request: &Message) -> bool {
+        false
+    }
+}
+
+impl TaskChange {
+    fn from_ascii_data(data: &[u8]) -> Result<Self, String> {
+        if data.len() < 3 {
+            return Err(format!("expected at least 3 bytes, got {}", data.len()));
+        }
+        let task = Task::try_from(parse_u8_dec("task", &data[..3])?)?;
+        Ok(TaskChange { task })
+    }
+    fn to_ascii(&self) -> AsciiPacket {
+        let msg = format!("TC{:03}000", self.task.0);
+        AsciiPacket::try_from(msg).expect("Task valid")
+    }
+    fn is_response_to(&self, request: &Message) -> bool {
+        matches!(request, Message::ActivateTask(t) if t.task == self.task)
     }
 }
 

@@ -75,12 +75,8 @@ use futures::{Future, Sink, SinkExt, Stream, StreamExt};
 use tokio::net::ToSocketAddrs;
 use tokio::time::Sleep;
 
-use crate::msg::{
-    ArmRequest, ArmingStatusReport, ArmingStatusRequest, Message, StringDescriptionRequest,
-    TextDescription, TextDescriptionType, TextDescriptions, Zone, ZoneStatus, ZoneStatusReport,
-    ZoneStatusRequest, NUM_AREAS, NUM_ZONES,
-};
-use crate::pkt::Packet;
+use crate::msg::{self, Message};
+use crate::pkt;
 use crate::tokio::Connection;
 
 /// Delay in applying an `ArmingReport` transition suspected of being spurious.
@@ -94,7 +90,7 @@ const SUSPICIOUS_TRANSITION_DELAY: Duration = Duration::from_secs(5);
 pub struct Panel {
     conn: Connection,
     state: PanelState,
-    pending_arm: Option<(Pin<Box<Sleep>>, ArmingStatusReport)>,
+    pending_arm: Option<(Pin<Box<Sleep>>, msg::ArmingStatusReport)>,
     cmd_state: CmdState,
 }
 
@@ -109,22 +105,22 @@ impl Panel {
         Self::with_connection(conn).await
     }
 
-    pub fn zone_name(&self, zone: Zone) -> &TextDescription {
+    pub fn zone_name(&self, zone: msg::Zone) -> &msg::TextDescription {
         &self.state.zone_names.0[zone.to_index()]
     }
 
-    pub fn area_names(&self) -> &TextDescriptions<NUM_AREAS> {
+    pub fn area_names(&self) -> &msg::TextDescriptions<{ msg::NUM_AREAS }> {
         &self.state.area_names
     }
 
-    pub fn arming_status(&self) -> &ArmingStatusReport {
+    pub fn arming_status(&self) -> &msg::ArmingStatusReport {
         self.state
             .arming_status
             .as_ref()
             .expect("arming_status is set post-init")
     }
 
-    pub fn zone_statuses(&self) -> &ZoneStatusReport {
+    pub fn zone_statuses(&self) -> &msg::ZoneStatusReport {
         self.state
             .zone_statuses
             .as_ref()
@@ -138,12 +134,16 @@ impl Panel {
             pending_arm: None,
             cmd_state: CmdState::Idle,
         };
-        this.init_req(ArmingStatusRequest {}.into()).await?;
-        this.init_req(ZoneStatusRequest {}.into()).await?;
-        this.send_sds(TextDescriptionType::Area, NUM_AREAS).await?;
-        this.send_sds(TextDescriptionType::Zone, NUM_ZONES).await?;
+        this.init_req(msg::ArmingStatusRequest {}.into()).await?;
+        this.init_req(msg::ZoneStatusRequest {}.into()).await?;
+        this.send_sds(msg::TextDescriptionType::Area, msg::NUM_AREAS)
+            .await?;
+        this.send_sds(msg::TextDescriptionType::Task, msg::NUM_TASKS)
+            .await?;
+        this.send_sds(msg::TextDescriptionType::Zone, msg::NUM_ZONES)
+            .await?;
         /*for i in 0..NUM_ZONES {
-            if this.zone_status.as_deref().unwrap()[i].physical() != ZonePhysicalStatus::Unconfigured {
+            if this.zone_status.as_deref().unwrap()[i].physical() != msg::ZonePhysicalStatus::Unconfigured {
                 this.init_req()
             }
         }*/
@@ -174,14 +174,14 @@ impl Panel {
     /// Sends a range of `sd` requests, waiting for each response.
     async fn send_sds(
         &mut self,
-        ty: TextDescriptionType,
+        ty: msg::TextDescriptionType,
         max: usize,
     ) -> Result<(), std::io::Error> {
         let mut unfilled_i = 0;
         while unfilled_i < max {
             let num = unfilled_i as u8 + 1;
             let reply = self
-                .init_req(StringDescriptionRequest { ty, num }.into())
+                .init_req(msg::StringDescriptionRequest { ty, num }.into())
                 .await?;
             let reply = match reply.msg {
                 Some(Ok(Message::StringDescriptionResponse(r))) => r,
@@ -203,7 +203,7 @@ impl Panel {
     }
 
     /// Interprets a received packet, creating an `Event` and updating state.
-    fn interpret(&mut self, pkt: Packet) -> Event {
+    fn interpret(&mut self, pkt: pkt::Packet) -> Event {
         let msg = Message::parse(&pkt).transpose();
         let mut change = None;
         let mut reply_to = None;
@@ -250,7 +250,7 @@ impl Panel {
         }
     }
 
-    fn interpret_arming_status(&mut self, msg: &ArmingStatusReport) -> Option<Change> {
+    fn interpret_arming_status(&mut self, msg: &msg::ArmingStatusReport) -> Option<Change> {
         let prior = match self.state.arming_status {
             None => {
                 self.state.arming_status = Some(*msg);
@@ -265,7 +265,7 @@ impl Panel {
         // Hold on to that message, and only apply it if there isn't another
         // transition within a reasonable time.
         if let Some((_, pending)) = self.pending_arm.take() {
-            if ArmingStatusReport::is_transition_suspicious(prior, msg) {
+            if msg::ArmingStatusReport::is_transition_suspicious(prior, msg) {
                 log::warn!(
                     "next arming report after suspicious transition is also suspicious; \
                      applying anyway\nprior: {:#?}\npending: {:#?}\nnew: {:#?}",
@@ -274,7 +274,7 @@ impl Panel {
                     &msg,
                 );
             }
-        } else if ArmingStatusReport::is_transition_suspicious(prior, msg) {
+        } else if msg::ArmingStatusReport::is_transition_suspicious(prior, msg) {
             log::debug!(
                 "Delaying arming status transition suspected to be spurious.\n\
                  prior: {:#?}\npending: {:#?}",
@@ -421,28 +421,31 @@ impl Sink<Command> for Panel {
 
 #[derive(Debug, Eq, PartialEq)]
 struct PanelState {
-    arming_status: Option<ArmingStatusReport>,
-    zone_statuses: Option<ZoneStatusReport>,
-    zone_names: TextDescriptions<NUM_ZONES>,
-    area_names: TextDescriptions<NUM_AREAS>,
+    arming_status: Option<msg::ArmingStatusReport>,
+    zone_statuses: Option<msg::ZoneStatusReport>,
+    zone_names: msg::TextDescriptions<{ msg::NUM_ZONES }>,
+    area_names: msg::TextDescriptions<{ msg::NUM_AREAS }>,
+    task_names: msg::TextDescriptions<{ msg::NUM_TASKS }>,
 }
 
 impl PanelState {
     /// Returns a const reference to the given names, if valid/understood.
     #[cfg(test)]
-    fn names(&self, ty: TextDescriptionType) -> Option<&[TextDescription]> {
+    fn names(&self, ty: msg::TextDescriptionType) -> Option<&[msg::TextDescription]> {
         Some(match ty {
-            TextDescriptionType::Area => &self.area_names.0[..],
-            TextDescriptionType::Zone => &self.zone_names.0[..],
+            msg::TextDescriptionType::Area => &self.area_names.0[..],
+            msg::TextDescriptionType::Task => &self.task_names.0[..],
+            msg::TextDescriptionType::Zone => &self.zone_names.0[..],
             _ => return None,
         })
     }
 
     /// Returns a mutable reference to the given names, if valid/understood.
-    fn names_mut(&mut self, ty: TextDescriptionType) -> Option<&mut [TextDescription]> {
+    fn names_mut(&mut self, ty: msg::TextDescriptionType) -> Option<&mut [msg::TextDescription]> {
         Some(match ty {
-            TextDescriptionType::Area => &mut self.area_names.0[..],
-            TextDescriptionType::Zone => &mut self.zone_names.0[..],
+            msg::TextDescriptionType::Area => &mut self.area_names.0[..],
+            msg::TextDescriptionType::Task => &mut self.task_names.0[..],
+            msg::TextDescriptionType::Zone => &mut self.zone_names.0[..],
             _ => return None,
         })
     }
@@ -454,16 +457,17 @@ impl Default for PanelState {
         Self {
             arming_status: None,
             zone_statuses: None,
-            zone_names: TextDescriptions::ALL_EMPTY,
-            area_names: TextDescriptions::ALL_EMPTY,
+            zone_names: msg::TextDescriptions::ALL_EMPTY,
+            area_names: msg::TextDescriptions::ALL_EMPTY,
+            task_names: msg::TextDescriptions::ALL_EMPTY,
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct Event {
-    pub pkt: Option<crate::pkt::Packet>,
-    pub msg: Option<Result<crate::msg::Message, crate::msg::Error>>,
+    pub pkt: Option<pkt::Packet>,
+    pub msg: Option<Result<Message, msg::Error>>,
 
     /// If this event completes a user-initiated command, its message.
     pub completes: Option<Message>,
@@ -481,21 +485,26 @@ pub struct Event {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Change {
     /// Received a `ZC` which does not match the zone's known prior state.
-    ZoneChange { zone: Zone, prior: ZoneStatus },
+    ZoneChange {
+        zone: msg::Zone,
+        prior: msg::ZoneStatus,
+    },
 
     /// Received a `AS` which does not match the prior arming state.
-    ArmingStatus { prior: ArmingStatusReport },
+    ArmingStatus { prior: msg::ArmingStatusReport },
 }
 
 #[derive(Clone, Debug)]
 pub enum Command {
-    Arm(ArmRequest),
+    Arm(msg::ArmRequest),
+    ActivateTask(msg::ActivateTask),
 }
 
 impl Command {
     fn into_msg(self) -> Message {
         match self {
             Command::Arm(m) => m.into(),
+            Command::ActivateTask(m) => m.into(),
         }
     }
 }
@@ -514,30 +523,23 @@ enum CmdState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        msg::{
-            AlarmState, Area, ArmCode, ArmLevel, ArmUpState, ArmingStatus, ArmingStatusReport,
-            StringDescriptionResponse, TextDescription, ZoneStatusReport, NUM_AREAS,
-        },
-        pkt::AsciiPacket,
-        tokio::testutil::socketpair,
-    };
+    use crate::tokio::testutil::socketpair;
 
     use pretty_assertions::assert_eq;
 
-    async fn send<P: Into<Packet>>(conn: &mut Connection, pkt: P) {
+    async fn send<P: Into<pkt::Packet>>(conn: &mut Connection, pkt: P) {
         conn.send(pkt.into()).await.unwrap();
     }
 
     async fn send_ascii(conn: &mut Connection, msg: &str) {
-        conn.send(AsciiPacket::try_from(msg).unwrap().into())
+        conn.send(pkt::AsciiPacket::try_from(msg).unwrap().into())
             .await
             .unwrap();
     }
 
     async fn next_msg(conn: &mut Connection) -> Option<Message> {
         let pkt = match conn.next().await {
-            Some(Ok(Packet::Ascii(p))) => p,
+            Some(Ok(pkt::Packet::Ascii(p))) => p,
             None => return None,
             _ => unreachable!(),
         };
@@ -556,18 +558,18 @@ mod tests {
                 Message::ZoneStatusRequest(_) => {
                     send(conn, state.zone_statuses.as_ref().unwrap()).await;
                 }
-                Message::StringDescriptionRequest(StringDescriptionRequest { ty, num }) => {
+                Message::StringDescriptionRequest(msg::StringDescriptionRequest { ty, num }) => {
                     let names = state.names(ty).unwrap();
                     let mut i = num as usize - 1;
                     while i < names.len() && names[i].is_empty() {
                         i += 1;
                     }
                     let (num, text) = if i == names.len() {
-                        (0, TextDescription::default())
+                        (0, msg::TextDescription::default())
                     } else {
                         (i as u8 + 1, names[i])
                     };
-                    send(conn, &StringDescriptionResponse { ty, num, text }).await;
+                    send(conn, &msg::StringDescriptionResponse { ty, num, text }).await;
                 }
                 _ => unreachable!(),
             }
@@ -579,18 +581,19 @@ mod tests {
         let (client, mut server) = socketpair().await;
 
         let mut state = PanelState {
-            arming_status: Some(ArmingStatusReport {
-                arming_status: [ArmingStatus::Disarmed; NUM_AREAS],
-                up_state: [ArmUpState::NotReadyToArm; NUM_AREAS],
-                alarm_state: [AlarmState::NoAlarmActive; NUM_AREAS],
+            arming_status: Some(msg::ArmingStatusReport {
+                arming_status: [msg::ArmingStatus::Disarmed; { msg::NUM_AREAS }],
+                up_state: [msg::ArmUpState::NotReadyToArm; { msg::NUM_AREAS }],
+                alarm_state: [msg::AlarmState::NoAlarmActive; { msg::NUM_AREAS }],
                 first_exit_time: 0,
             }),
-            zone_statuses: Some(ZoneStatusReport::ALL_UNCONFIGURED),
-            zone_names: TextDescriptions::ALL_EMPTY,
-            area_names: TextDescriptions::ALL_EMPTY,
+            zone_statuses: Some(msg::ZoneStatusReport::ALL_UNCONFIGURED),
+            zone_names: msg::TextDescriptions::ALL_EMPTY,
+            area_names: msg::TextDescriptions::ALL_EMPTY,
+            task_names: msg::TextDescriptions::ALL_EMPTY,
         };
-        state.zone_names.0[1] = TextDescription::new("front door").unwrap();
-        state.zone_statuses.as_mut().unwrap().zones[0] = ZoneStatus::new(
+        state.zone_names.0[1] = msg::TextDescription::new("front door").unwrap();
+        state.zone_statuses.as_mut().unwrap().zones[0] = msg::ZoneStatus::new(
             crate::msg::ZoneLogicalStatus::Normal,
             crate::msg::ZonePhysicalStatus::EOL,
         );
@@ -614,7 +617,7 @@ mod tests {
             tokio::join!(send_ascii(server, a.msg), async {
                 let event = panel.next().await.unwrap().unwrap();
                 match &event.pkt {
-                    Some(Packet::Ascii(p)) => assert_eq!(&p[..], a.msg),
+                    Some(pkt::Packet::Ascii(p)) => assert_eq!(&p[..], a.msg),
                     _ => unreachable!(),
                 }
                 (a.checker)(&event, &panel);
@@ -626,15 +629,16 @@ mod tests {
     async fn follow_arm_with_delay() {
         let (client, mut server) = socketpair().await;
         const INITIAL: PanelState = PanelState {
-            arming_status: Some(ArmingStatusReport {
-                arming_status: [ArmingStatus::Disarmed; NUM_AREAS],
-                up_state: [ArmUpState::ReadyToArm; NUM_AREAS],
-                alarm_state: [AlarmState::NoAlarmActive; NUM_AREAS],
+            arming_status: Some(msg::ArmingStatusReport {
+                arming_status: [msg::ArmingStatus::Disarmed; { msg::NUM_AREAS }],
+                up_state: [msg::ArmUpState::ReadyToArm; { msg::NUM_AREAS }],
+                alarm_state: [msg::AlarmState::NoAlarmActive; { msg::NUM_AREAS }],
                 first_exit_time: 0,
             }),
-            zone_statuses: Some(ZoneStatusReport::ALL_UNCONFIGURED),
-            zone_names: TextDescriptions::ALL_EMPTY,
-            area_names: TextDescriptions::ALL_EMPTY,
+            zone_statuses: Some(msg::ZoneStatusReport::ALL_UNCONFIGURED),
+            zone_names: msg::TextDescriptions::ALL_EMPTY,
+            area_names: msg::TextDescriptions::ALL_EMPTY,
+            task_names: msg::TextDescriptions::ALL_EMPTY,
         };
 
         let mut panel = Panel {
@@ -707,7 +711,7 @@ mod tests {
                     assert!(panel.pending_arm.is_none());
                     assert_eq!(
                         panel.state.arming_status.unwrap().arming_status[0],
-                        ArmingStatus::ArmedStay
+                        msg::ArmingStatus::ArmedStay
                     );
                 },
             },
@@ -719,15 +723,16 @@ mod tests {
     async fn arm_bad_code() {
         let (client, mut server) = socketpair().await;
         const INITIAL: PanelState = PanelState {
-            arming_status: Some(ArmingStatusReport {
-                arming_status: [ArmingStatus::Disarmed; NUM_AREAS],
-                up_state: [ArmUpState::ReadyToArm; NUM_AREAS],
-                alarm_state: [AlarmState::NoAlarmActive; NUM_AREAS],
+            arming_status: Some(msg::ArmingStatusReport {
+                arming_status: [msg::ArmingStatus::Disarmed; { msg::NUM_AREAS }],
+                up_state: [msg::ArmUpState::ReadyToArm; { msg::NUM_AREAS }],
+                alarm_state: [msg::AlarmState::NoAlarmActive; { msg::NUM_AREAS }],
                 first_exit_time: 0,
             }),
-            zone_statuses: Some(ZoneStatusReport::ALL_UNCONFIGURED),
-            zone_names: TextDescriptions::ALL_EMPTY,
-            area_names: TextDescriptions::ALL_EMPTY,
+            zone_statuses: Some(msg::ZoneStatusReport::ALL_UNCONFIGURED),
+            zone_names: msg::TextDescriptions::ALL_EMPTY,
+            area_names: msg::TextDescriptions::ALL_EMPTY,
+            task_names: msg::TextDescriptions::ALL_EMPTY,
         };
         let mut panel = Panel {
             conn: client,
@@ -736,10 +741,10 @@ mod tests {
             cmd_state: CmdState::Idle,
         };
         panel
-            .send(Command::Arm(ArmRequest {
-                area: Area::try_from(1).unwrap(),
-                level: ArmLevel::ArmedStay,
-                code: ArmCode::try_from(1234).unwrap(),
+            .send(Command::Arm(msg::ArmRequest {
+                area: msg::Area::try_from(1).unwrap(),
+                level: msg::ArmLevel::ArmedStay,
+                code: msg::ArmCode::try_from(1234).unwrap(),
             }))
             .await
             .unwrap();
