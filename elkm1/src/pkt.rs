@@ -179,6 +179,11 @@ impl PartialEq for InvalidPacket {
 ///   * all messages must start with message type and subtype bytes.
 ///   * the message length (of the included bytes and the checksum) must fit in 2 hexadigits.
 ///
+/// TODO: the Elk spec for `SD` says "The high bit of the first character in the
+/// text string may be set as the “Show On Keypad” bit. Mask out the high bit
+/// for proper ASCII display." If this is true, we should be using `&[u8]`
+/// rather than actually expecting all these messages to be ASCII.
+///
 /// To decode a framed packet, see [`Packet::decode`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AsciiPacket(String);

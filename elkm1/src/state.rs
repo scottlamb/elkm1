@@ -24,13 +24,26 @@
 //! > failure retries which may take 2 to 3 seconds to transmit to a faulty
 //! > light control signal.
 //!
-//! Currently `Panel` attempts to wait for a response after each command. This
-//! seems theoretically imperfect because the Elk's asynchronous messages may be
-//! indistinguishable from (untagged) command replies. If this becomes a problem
-//! in practice, a future version may also impose a delay on any message whose
-//! reply can be sent unsolicited.
+//! Currently `Panel` attempts to wait for a response after each command, with
+//! caveats:
 //!
-//! ## State tracking ##
+//! *   This seems theoretically imperfect because the Elk's asynchronous
+//!     messages may be indistinguishable from (untagged) command replies. If
+//!     this becomes a problem in practice, a future version may also impose a
+//!     delay on any message whose reply can be sent unsolicited.
+//! *   It's not even clear from the protocol description the full list of
+//!     messages which could be replies to a given command. If we don't
+//!     recognize a response, `Panel` will never be ready to send more
+//!     commands. We could add a timeout to resolve this.
+//! *   Similarly, if a message is lost in either direction due to problems
+//!     at the physical layer, `Panel` will never be ready to send more
+//!     commands.
+//!
+//! There's currently no queueing. If you call `SinkExt::send` twice in a row,
+//! the first will succeed but the second will hang. The response must be read
+//! before the `Panel` is ready to accept a second command.
+//!
+//! ## State tracking
 //!
 //! On connection start, `Panel` will send commands to learn the state of the
 //! Elk:
@@ -44,9 +57,18 @@
 //! It will update these according to received messages. If the Elk is
 //! configured to send asynchronous updates (see global settings 36–40),
 //! `Panel`'s state should track the Elk's.
+//!
+//! ## Workarounds
+//!
+//! When arming with an exit timer, the Elk appears to send an
+//! incorrect "fully armed" message and a correct "exit timer pending" message
+//! in short succession, and a correct "fully armed" message later. Logic in
+//! this layer looks for suspicious transitions and suppresses them unless
+//! the following message never comes. Further workarounds may be added in the
+//! future as needed to accurately track the Elk's state.
 
 use std::pin::Pin;
-use std::task::Poll;
+use std::task::{Poll, Waker};
 use std::time::Duration;
 
 use futures::{Future, Sink, SinkExt, Stream, StreamExt};
@@ -54,9 +76,9 @@ use tokio::net::ToSocketAddrs;
 use tokio::time::Sleep;
 
 use crate::msg::{
-    ArmingStatusReport, ArmingStatusRequest, Message, StringDescriptionRequest, TextDescription,
-    TextDescriptionType, TextDescriptions, Zone, ZoneStatus, ZoneStatusReport, ZoneStatusRequest,
-    NUM_AREAS, NUM_ZONES,
+    ArmRequest, ArmingStatusReport, ArmingStatusRequest, Message, StringDescriptionRequest,
+    TextDescription, TextDescriptionType, TextDescriptions, Zone, ZoneStatus, ZoneStatusReport,
+    ZoneStatusRequest, NUM_AREAS, NUM_ZONES,
 };
 use crate::pkt::Packet;
 use crate::tokio::Connection;
@@ -73,6 +95,7 @@ pub struct Panel {
     conn: Connection,
     state: PanelState,
     pending_arm: Option<(Pin<Box<Sleep>>, ArmingStatusReport)>,
+    cmd_state: CmdState,
 }
 
 impl Panel {
@@ -113,6 +136,7 @@ impl Panel {
             conn,
             state: PanelState::default(),
             pending_arm: None,
+            cmd_state: CmdState::Idle,
         };
         this.init_req(ArmingStatusRequest {}.into()).await?;
         this.init_req(ZoneStatusRequest {}.into()).await?;
@@ -136,7 +160,7 @@ impl Panel {
             let received = self.interpret(received?);
             log::debug!("init_req: received {:#?}", &received);
             if let Some(Ok(r)) = &received.msg {
-                if r.is_reply_to(&send) {
+                if r.is_response_to(&send) {
                     return Ok(received);
                 }
             }
@@ -182,6 +206,7 @@ impl Panel {
     fn interpret(&mut self, pkt: Packet) -> Event {
         let msg = Message::parse(&pkt).transpose();
         let mut change = None;
+        let mut reply_to = None;
         if let Some(Ok(m)) = &msg {
             match m {
                 Message::ArmingStatusReport(m) => {
@@ -205,11 +230,23 @@ impl Panel {
                 }
                 _ => {}
             }
+            if let CmdState::Busy { request, waker, .. } = &mut self.cmd_state {
+                if m.is_response_to(request) {
+                    if let Some(w) = waker.take() {
+                        w.wake();
+                    }
+                    reply_to = match std::mem::replace(&mut self.cmd_state, CmdState::Idle) {
+                        CmdState::Busy { request, .. } => Some(request),
+                        _ => unreachable!(),
+                    };
+                }
+            }
         }
         Event {
             pkt: Some(pkt),
             msg,
             change,
+            completes: reply_to,
         }
     }
 
@@ -288,6 +325,7 @@ impl Stream for Panel {
                     pkt: None,
                     msg: None,
                     change: Some(Change::ArmingStatus { prior }),
+                    completes: None,
                 };
                 log::warn!(
                     "Deferred arming status taking effect.\n\
@@ -301,7 +339,7 @@ impl Stream for Panel {
             }
         }
 
-        // TODO: send anything that needs to be sent...
+        // TODO: should we automatically do a <Self as Sink>::poll_flush here?
 
         Poll::Pending
     }
@@ -315,25 +353,69 @@ impl Sink<Command> for Panel {
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
-        todo!()
+        let this = Pin::into_inner(self);
+        match &mut this.cmd_state {
+            CmdState::Idle => Poll::Ready(Ok(())),
+            CmdState::Busy { flushed, waker, .. } => {
+                if !*flushed {
+                    match this.conn.poll_flush_unpin(cx) {
+                        Poll::Ready(Ok(())) => {}
+                        o => return o,
+                    }
+                    *flushed = true;
+                }
+                // <Panel as Stream>::poll_ready needs to be called before Sink
+                // can make progress. When this command finishes, it needs to
+                // wake up the caller. Save the waker if necessary.
+                if !matches!(waker, Some(w) if cx.waker().will_wake(w)) {
+                    *waker = Some(cx.waker().clone());
+                }
+                Poll::Pending
+            }
+        }
     }
 
     fn start_send(self: Pin<&mut Self>, item: Command) -> Result<(), Self::Error> {
-        todo!()
+        let this = Pin::into_inner(self);
+        assert!(matches!(this.cmd_state, CmdState::Idle));
+        let msg = item.into_msg();
+        log::debug!("Sending {:?}", &msg);
+        this.conn.start_send_unpin(msg.to_pkt())?;
+        this.cmd_state = CmdState::Busy {
+            request: msg,
+            flushed: false,
+            waker: None,
+        };
+        Ok(())
     }
 
     fn poll_flush(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
-        todo!()
+        let this = Pin::into_inner(self);
+        match &mut this.cmd_state {
+            CmdState::Busy { flushed, .. } if !*flushed => {
+                match this.conn.poll_flush_unpin(cx) {
+                    Poll::Ready(Ok(())) => {}
+                    o => return o,
+                }
+                *flushed = true;
+            }
+            _ => {}
+        }
+        Poll::Ready(Ok(()))
     }
 
     fn poll_close(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), Self::Error>> {
-        todo!()
+        match self.as_mut().poll_flush(cx) {
+            Poll::Ready(Ok(())) => {}
+            o => return o,
+        }
+        Pin::into_inner(self).conn.poll_close_unpin(cx)
     }
 }
 
@@ -382,6 +464,9 @@ impl Default for PanelState {
 pub struct Event {
     pub pkt: Option<crate::pkt::Packet>,
     pub msg: Option<Result<crate::msg::Message, crate::msg::Error>>,
+
+    /// If this event completes a user-initiated command, its message.
+    pub completes: Option<Message>,
     pub change: Option<Change>,
 }
 
@@ -403,15 +488,36 @@ pub enum Change {
 }
 
 #[derive(Clone, Debug)]
-pub enum Command {}
+pub enum Command {
+    Arm(ArmRequest),
+}
+
+impl Command {
+    fn into_msg(self) -> Message {
+        match self {
+            Command::Arm(m) => m.into(),
+        }
+    }
+}
+
+enum CmdState {
+    Idle,
+    Busy {
+        request: Message,
+        flushed: bool,
+
+        /// A waker to awaken when transitioning to `Idle` state.
+        waker: Option<Waker>,
+    },
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         msg::{
-            AlarmState, ArmUpState, ArmingStatus, ArmingStatusReport, StringDescriptionResponse,
-            TextDescription, ZoneStatusReport, NUM_AREAS,
+            AlarmState, Area, ArmCode, ArmLevel, ArmUpState, ArmingStatus, ArmingStatusReport,
+            StringDescriptionResponse, TextDescription, ZoneStatusReport, NUM_AREAS,
         },
         pkt::AsciiPacket,
         tokio::testutil::socketpair,
@@ -535,6 +641,7 @@ mod tests {
             conn: client,
             state: INITIAL,
             pending_arm: None,
+            cmd_state: CmdState::Idle,
         };
         // t= 0: IC0000000000000010200           2022-02-14T21:54:23Z
         // t= 0: LD117300111354021400022200
@@ -606,5 +713,51 @@ mod tests {
             },
         ];
         follow_activities(&activities, &mut panel, &mut server).await;
+    }
+
+    #[tokio::test]
+    async fn arm_bad_code() {
+        let (client, mut server) = socketpair().await;
+        const INITIAL: PanelState = PanelState {
+            arming_status: Some(ArmingStatusReport {
+                arming_status: [ArmingStatus::Disarmed; NUM_AREAS],
+                up_state: [ArmUpState::ReadyToArm; NUM_AREAS],
+                alarm_state: [AlarmState::NoAlarmActive; NUM_AREAS],
+                first_exit_time: 0,
+            }),
+            zone_statuses: Some(ZoneStatusReport::ALL_UNCONFIGURED),
+            zone_names: TextDescriptions::ALL_EMPTY,
+            area_names: TextDescriptions::ALL_EMPTY,
+        };
+        let mut panel = Panel {
+            conn: client,
+            state: INITIAL,
+            pending_arm: None,
+            cmd_state: CmdState::Idle,
+        };
+        panel
+            .send(Command::Arm(ArmRequest {
+                area: Area::try_from(1).unwrap(),
+                level: ArmLevel::ArmedStay,
+                code: ArmCode::try_from(1234).unwrap(),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_msg(&mut server).await,
+            Some(Message::ArmRequest(_))
+        ));
+        assert!(matches!(
+            panel.cmd_state,
+            CmdState::Busy { flushed: true, .. }
+        ));
+        send_ascii(&mut server, "IC0001020304140000100").await;
+        let event = panel.next().await.unwrap().unwrap();
+        assert!(
+            matches!(event.msg, Some(Ok(Message::SendCode(_)))),
+            "{:#?}",
+            &event
+        );
+        assert!(matches!(panel.cmd_state, CmdState::Idle));
     }
 }

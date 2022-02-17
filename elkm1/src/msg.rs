@@ -22,8 +22,10 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-fn parse_u8_dec(name: &str, val: &str) -> Result<u8, String> {
-    u8::from_str(val)
+fn parse_u8_dec(name: &str, val: &[u8]) -> Result<u8, String> {
+    let as_str = std::str::from_utf8(val)
+        .map_err(|_| format!("{} expected to be decimal in [0, 255); was bad utf-8", name))?;
+    u8::from_str(as_str)
         .map_err(|_| format!("{} expected to be decimal in [0, 255); got {:?}", name, val))
 }
 
@@ -57,10 +59,10 @@ macro_rules! messages {
             }
 
             /// Returns true if this message may be a reply to `request`.
-            pub fn is_reply_to(&self, request: &Message) -> bool {
+            pub fn is_response_to(&self, request: &Message) -> bool {
                 match self {
                     $(
-                        Message::$m(m) => m.is_reply_to(request),
+                        Message::$m(m) => m.is_response_to(request),
                     )*
                 }
             }
@@ -95,6 +97,14 @@ macro_rules! messages {
 }
 
 messages! {
+    /// `aL`: Arm/Disarm Request.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ArmRequest {
+        pub area: Area,
+        pub level: ArmLevel,
+        pub code: ArmCode,
+    }
+
     /// `as`: Arming Status Request.
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct ArmingStatusRequest {}
@@ -119,6 +129,24 @@ messages! {
         /// The armed state, which according to documentation is only present
         /// for M1 Ver. 4.1.18, 5.1.18 or later.
         pub armed_state: Option<ArmedState>,
+    }
+
+    /// `IC`:  Send Valid User Number and Invalid User Code.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct SendCode {
+        /// The code, or all 0s if it represents a valid user.
+        ///
+        /// If this was entered on an Elk keypad, each of the six bytes will
+        /// be a digit `[0, 9]`. That is, a zero on the keypad becomes an ASCII
+        /// NUL, not a `b'0'`. If the Elk is configured for four-digit codes,
+        /// the leading two digits will always be `0`.
+        code: [u8; 6],
+
+        /// The user code number.
+        ///
+        /// There are several "special" values.
+        user: u8,
+        keypad: Keypad,
     }
 
     /// `sd`: Request ASCII String Text Descriptions.
@@ -164,22 +192,26 @@ impl Message {
     }
 
     pub fn parse_ascii(pkt: &AsciiPacket) -> Result<Option<Self>, Error> {
-        if pkt.len() < 4 {
+        let payload = pkt.as_bytes();
+        if payload.len() < 4 {
             return Err(Error("malformed ASCII message: too short".into()));
         }
-        let (cmd, data) = pkt.split_at(2);
+        let (cmd, data) = payload.split_at(2);
         match cmd {
-            "as" => ArmingStatusRequest::from_ascii_data(data).map(Self::ArmingStatusRequest),
-            "AS" => ArmingStatusReport::from_ascii_data(data).map(Self::ArmingStatusReport),
-            "EE" => SendTimeData::from_ascii_data(data).map(Self::SendTimeData),
-            "sd" => {
+            b"a0" | b"a1" | b"a2" | b"a3" | b"a4" | b"a5" | b"a6" | b"a7" | b"a8" | b"a9"
+            | b"a:" => ArmRequest::from_ascii(cmd[1], data).map(Self::ArmRequest),
+            b"as" => ArmingStatusRequest::from_ascii_data(data).map(Self::ArmingStatusRequest),
+            b"AS" => ArmingStatusReport::from_ascii_data(data).map(Self::ArmingStatusReport),
+            b"EE" => SendTimeData::from_ascii_data(data).map(Self::SendTimeData),
+            b"IC" => SendCode::from_ascii_data(data).map(Self::SendCode),
+            b"sd" => {
                 StringDescriptionRequest::from_ascii_data(data).map(Self::StringDescriptionRequest)
             }
-            "SD" => StringDescriptionResponse::from_ascii_data(data)
+            b"SD" => StringDescriptionResponse::from_ascii_data(data)
                 .map(Self::StringDescriptionResponse),
-            "ZC" => ZoneChange::from_ascii_data(data).map(Self::ZoneChange),
-            "zs" => ZoneStatusRequest::from_ascii_data(data).map(Self::ZoneStatusRequest),
-            "ZS" => ZoneStatusReport::from_ascii_data(data).map(Self::ZoneStatusReport),
+            b"ZC" => ZoneChange::from_ascii_data(data).map(Self::ZoneChange),
+            b"zs" => ZoneStatusRequest::from_ascii_data(data).map(Self::ZoneStatusRequest),
+            b"ZS" => ZoneStatusReport::from_ascii_data(data).map(Self::ZoneStatusReport),
             _ => return Ok(None),
         }
         .map(Some)
@@ -268,6 +300,88 @@ macro_rules! num_enum {
 }
 
 byte_enum! {
+    /// The arming level in an [`ArmRequest`].
+    pub enum ArmLevel {
+        Disarm = b'0',
+        ArmedAway = b'1',
+        ArmedStay = b'2',
+        ArmedStayInstant = b'3',
+        ArmedNight = b'4',
+        ArmedNightInstant = b'5',
+        ArmedVacation = b'6',
+
+        /// Arm to next away mode; requires M1 Ver. 4.28 or later.
+        ArmToNextAwayMode = b'7',
+
+        /// Arm to next stay mode; requires M1 Ver. 4.28 or later.
+        ArmToNextStayMode = b'8',
+
+        /// Force arm to away; requires M1 Ver. 4.28 or later.
+        ForceArmToAway = b'9',
+
+        /// Force arm to stay; requires M1 Ver. 4.28 or later.
+        ForceArmToStay = b':',
+    }
+}
+
+/// A six-digit numeric arm code.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ArmCode([u8; 6]);
+
+impl std::fmt::Debug for ArmCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let as_str = std::str::from_utf8(&self.0[..]).expect("ArmCode is valid UTF-8");
+        as_str.fmt(f)
+    }
+}
+
+/// Converts from a number.
+impl TryFrom<u32> for ArmCode {
+    type Error = String;
+
+    fn try_from(n: u32) -> Result<Self, String> {
+        if n >= 1_000000 {
+            return Err("code out of range".into());
+        }
+        let n = format!("{:06}", n);
+        let mut copied = [0u8; 6];
+        copied.copy_from_slice(n.as_bytes());
+        Ok(ArmCode(copied))
+    }
+}
+
+/// Converts from ASCII digits.
+impl TryFrom<&[u8]> for ArmCode {
+    type Error = String;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        if value.len() != 6 {
+            return Err("ArmCode must be of length 6".to_owned());
+        }
+        let mut code = [0u8; 6];
+        code.copy_from_slice(value);
+        if code.iter().any(|&b| b < b'0' || b > b'9') {
+            return Err("ArmCode must be numeric".to_owned());
+        }
+        Ok(ArmCode(code))
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+impl Arbitrary<'_> for ArmCode {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
+        let buf = u.bytes(3)?;
+        let n = (u32::from(buf[0]) << 24) | (u32::from(buf[1]) << 16) | (u32::from(buf[2]));
+        ArmCode::try_from(n).map_err(|_| arbitrary::Error::IncorrectFormat)
+    }
+
+    fn size_hint(depth: usize) -> (usize, Option<usize>) {
+        let _ = depth;
+        (3, Some(3))
+    }
+}
+
+byte_enum! {
     /// Type of time, used in [`SendTimeData`].
     pub enum TimeDataType {
         Exit = b'0',
@@ -307,9 +421,8 @@ macro_rules! limited_u8 {
         #[cfg(feature = "arbitrary")]
         impl Arbitrary<'_> for $t {
             fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-                let mut buf = [0u8; 1];
-                u.fill_buffer(&mut buf)?;
-                $t::try_from(buf[0]).map_err(|_| arbitrary::Error::IncorrectFormat)
+                let b = u.bytes(1)?[0];
+                $t::try_from(b).map_err(|_| arbitrary::Error::IncorrectFormat)
             }
 
             fn size_hint(_depth: usize) -> (usize, Option<usize>) {
@@ -362,23 +475,27 @@ limited_u8! {
     Area max=8
 }
 
+limited_u8! {
+    /// A keypad number in the range of `[1, 16]`.
+    Keypad max=16
+}
+
 impl SendTimeData {
-    fn from_ascii_data(data: &str) -> Result<Self, String> {
+    fn from_ascii_data(data: &[u8]) -> Result<Self, String> {
         if data.len() < 10 {
             return Err(format!("expected at least 10 bytes, got {}", data.len()));
         }
-        let area = match data.as_bytes()[0] {
+        let area = match data[0] {
             b @ b'1'..=b'8' => Area(b - b'0'),
             b => return Err(format!("expected area in [1, 8], got {:?}", b)),
         };
-        let ty = TimeDataType::try_from(data.as_bytes()[1])?;
+        let ty = TimeDataType::try_from(data[1])?;
         let timer1 = parse_u8_dec("timer1", &data[2..5])?;
         let timer2 = parse_u8_dec("timer2", &data[5..8])?;
-        let bytes = data.as_bytes();
-        let armed_state = if bytes.len() < 11 {
+        let armed_state = if data.len() < 11 {
             None
         } else {
-            Some(ArmedState::try_from(bytes[8])?)
+            Some(ArmedState::try_from(data[8])?)
         };
         Ok(SendTimeData {
             area,
@@ -399,7 +516,7 @@ impl SendTimeData {
         msg.push_str("00"); // reserved
         AsciiPacket::try_from(msg).expect("SendTimeData invalid")
     }
-    pub fn is_reply_to(&self, _request: &Message) -> bool {
+    pub fn is_response_to(&self, _request: &Message) -> bool {
         false
     }
 }
@@ -460,12 +577,15 @@ impl ZoneStatus {
 #[cfg(feature = "arbitrary")]
 impl Arbitrary<'_> for ZoneStatus {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-        let mut buf = [0u8; 1];
-        u.fill_buffer(&mut buf)?;
-        if (buf[0] & 0xF0) != 0 {
+        let b = u.bytes(1)?[0];
+        if (b & 0xF0) != 0 {
             return Err(arbitrary::Error::IncorrectFormat);
         }
-        Ok(Self(buf[0]))
+        Ok(Self(b))
+    }
+
+    fn size_hint(_depth: usize) -> (usize, Option<usize>) {
+        (1, Some(1))
     }
 }
 
@@ -490,33 +610,33 @@ pub enum ZoneLogicalStatus {
 }
 
 impl ZoneChange {
-    fn from_ascii_data(data: &str) -> Result<Self, String> {
+    fn from_ascii_data(data: &[u8]) -> Result<Self, String> {
         if data.len() < 4 {
             return Err(format!("expected at least 4 bytes, got {}", data.len()));
         }
         let zone = Zone::try_from(parse_u8_dec("zone", &data[0..3])?)?;
         Ok(ZoneChange {
             zone,
-            status: ZoneStatus::from_ascii(data.as_bytes()[3])?,
+            status: ZoneStatus::from_ascii(data[3])?,
         })
     }
     fn to_ascii(&self) -> AsciiPacket {
         let msg = format!("ZC{:03}{:1X}00", self.zone, self.status.0);
         AsciiPacket::try_from(msg).expect("ZoneChange invalid")
     }
-    pub fn is_reply_to(&self, _request: &Message) -> bool {
+    pub fn is_response_to(&self, _request: &Message) -> bool {
         false
     }
 }
 
 impl ZoneStatusRequest {
-    fn from_ascii_data(_data: &str) -> Result<Self, String> {
+    fn from_ascii_data(_data: &[u8]) -> Result<Self, String> {
         Ok(ZoneStatusRequest {})
     }
     fn to_ascii(&self) -> AsciiPacket {
         AsciiPacket::try_from("zs00".to_owned()).expect("ZoneStatusRequest invalid")
     }
-    pub fn is_reply_to(&self, _request: &Message) -> bool {
+    pub fn is_response_to(&self, _request: &Message) -> bool {
         false
     }
 }
@@ -528,18 +648,17 @@ impl ZoneStatusReport {
         zones: [ZoneStatus::UNCONFIGURED; 208],
     };
 
-    fn from_ascii_data(data: &str) -> Result<Self, String> {
-        let args = data.as_bytes();
-        if args.len() < NUM_ZONES {
+    fn from_ascii_data(data: &[u8]) -> Result<Self, String> {
+        if data.len() < NUM_ZONES {
             return Err(format!(
                 "expected at least {} bytes, got {}",
                 NUM_ZONES,
-                args.len()
+                data.len()
             ));
         }
         let mut zones = [ZoneStatus(0); NUM_ZONES];
         for i in 0..NUM_ZONES {
-            zones[i] = ZoneStatus::from_ascii(args[i])?;
+            zones[i] = ZoneStatus::from_ascii(data[i])?;
         }
         Ok(ZoneStatusReport { zones })
     }
@@ -552,7 +671,7 @@ impl ZoneStatusReport {
         msg.extend(b"00");
         AsciiPacket::try_from(msg).expect("ZoneStatusReport should be valid")
     }
-    pub fn is_reply_to(&self, request: &Message) -> bool {
+    pub fn is_response_to(&self, request: &Message) -> bool {
         matches!(request, Message::ZoneStatusRequest(_))
     }
 }
@@ -570,14 +689,44 @@ impl std::fmt::Debug for ZoneStatusReport {
     }
 }
 
+impl ArmRequest {
+    fn from_ascii(subtype: u8, data: &[u8]) -> Result<Self, String> {
+        // Message::parse will only call ArmRequest with valid subtypes.
+        let level = ArmLevel::try_from(subtype).expect("subtype must be valid");
+        if data.len() < 9 {
+            return Err(format!(
+                "Expected ArmRequest to have at least 9 bytes of data, got {}",
+                data.len()
+            ));
+        }
+        let area = Area::try_from(parse_u8_dec("area", &data[0..1])?)?;
+        let code = ArmCode::try_from(&data[1..7])?;
+        Ok(ArmRequest { area, level, code })
+    }
+
+    pub fn to_ascii(&self) -> AsciiPacket {
+        let msg: Vec<u8> = [b'a', self.level as u8, self.area.0 + b'0']
+            .iter()
+            .chain(self.code.0.iter())
+            .chain(b"00".iter())
+            .copied()
+            .collect();
+        AsciiPacket::try_from(msg).expect("ArmRequest invalid")
+    }
+
+    pub fn is_response_to(&self, _request: &Message) -> bool {
+        false
+    }
+}
+
 impl ArmingStatusRequest {
-    fn from_ascii_data(_data: &str) -> Result<Self, String> {
+    fn from_ascii_data(_data: &[u8]) -> Result<Self, String> {
         Ok(ArmingStatusRequest {})
     }
     pub fn to_ascii(&self) -> AsciiPacket {
         AsciiPacket::try_from("as00".to_owned()).expect("ArmingStatusRequest invalid")
     }
-    pub fn is_reply_to(&self, _request: &Message) -> bool {
+    pub fn is_response_to(&self, _request: &Message) -> bool {
         false
     }
 }
@@ -643,8 +792,7 @@ impl ArmingStatus {
 }
 
 impl ArmingStatusReport {
-    fn from_ascii_data(data: &str) -> Result<Self, String> {
-        let data = data.as_bytes();
+    fn from_ascii_data(data: &[u8]) -> Result<Self, String> {
         if data.len() < 26 {
             return Err(format!("expected at least {} data", 26));
         }
@@ -676,7 +824,7 @@ impl ArmingStatusReport {
             .collect();
         AsciiPacket::try_from(msg).expect("ArmingStatusResponse valid ascii")
     }
-    pub fn is_reply_to(&self, request: &Message) -> bool {
+    pub fn is_response_to(&self, request: &Message) -> bool {
         matches!(request, Message::ArmingStatusRequest(_))
     }
 
@@ -727,8 +875,39 @@ num_enum! {
     }
 }
 
+impl SendCode {
+    fn from_ascii_data(data: &[u8]) -> Result<Self, String> {
+        if data.len() < 19 {
+            return Err(format!("expected at least 19 bytes, got {}", data.len()));
+        }
+        let mut code = [0u8; 6];
+        for i in 0..6 {
+            code[i] = AsciiPacket::dehex_byte(data[2 * i], data[2 * i + 1])
+                .map_err(|()| "invalid hex code")?;
+        }
+        let user = parse_u8_dec("user", &data[12..15])?;
+        let keypad = Keypad::try_from(parse_u8_dec("keypad", &data[15..17])?)?;
+        Ok(SendCode { code, user, keypad })
+    }
+    fn is_response_to(&self, request: &Message) -> bool {
+        // We could narrow it down further by eliminating invalid code responses with a different
+        // code, but this is probably pointless.
+        matches!(request, Message::ArmRequest(_))
+    }
+    fn to_ascii(&self) -> AsciiPacket {
+        let trailer = format!("{:03}{:02}00", self.user, self.keypad);
+        let msg: Vec<u8> = [b'I', b'C']
+            .iter()
+            .copied()
+            .chain(self.code.iter().copied().flat_map(AsciiPacket::hex_byte))
+            .chain(trailer.as_bytes().iter().copied())
+            .collect();
+        AsciiPacket::try_from(msg).expect("SendCode valid")
+    }
+}
+
 impl StringDescriptionRequest {
-    fn from_ascii_data(data: &str) -> Result<Self, String> {
+    fn from_ascii_data(data: &[u8]) -> Result<Self, String> {
         if data.len() < 5 {
             return Err(format!("expected at least 5 bytes, got {}", data.len()));
         }
@@ -736,7 +915,7 @@ impl StringDescriptionRequest {
         let num = parse_u8_dec("num", &data[2..5])?;
         Ok(StringDescriptionRequest { ty, num })
     }
-    fn is_reply_to(&self, _request: &Message) -> bool {
+    fn is_response_to(&self, _request: &Message) -> bool {
         false
     }
     fn to_ascii(&self) -> AsciiPacket {
@@ -851,18 +1030,13 @@ impl std::cmp::PartialEq<str> for TextDescription {
 }
 
 impl StringDescriptionResponse {
-    fn from_ascii_data(data: &str) -> Result<Self, String> {
+    fn from_ascii_data(data: &[u8]) -> Result<Self, String> {
         if data.len() < 21 {
             return Err(format!("expected at least 5 bytes, got {}", data.len()));
         }
         let ty = TextDescriptionType::try_from(parse_u8_dec("type", &data[0..2])?)?;
         let num = parse_u8_dec("num", &data[2..5])?;
-        let text = TextDescription(
-            data[5..21]
-                .as_bytes()
-                .try_into()
-                .expect("text slice->array"),
-        );
+        let text = TextDescription(data[5..21].try_into().expect("slice->array"));
         Ok(StringDescriptionResponse { ty, num, text })
     }
     fn to_ascii(&self) -> AsciiPacket {
@@ -874,7 +1048,7 @@ impl StringDescriptionResponse {
         );
         AsciiPacket::try_from(msg).expect("StringDescriptionResponse valid")
     }
-    fn is_reply_to(&self, request: &Message) -> bool {
+    fn is_response_to(&self, request: &Message) -> bool {
         matches!(
             request,
             Message::StringDescriptionRequest(StringDescriptionRequest { ty, num })
@@ -945,6 +1119,21 @@ mod tests {
                 timer1: 30,
                 timer2: 0,
                 armed_state: Some(ArmedState::ArmedAway),
+            })
+        );
+        assert_eq!(msg.to_pkt(), pkt);
+    }
+
+    #[test]
+    fn valid_new_ic_report() {
+        let pkt = Packet::Ascii(AsciiPacket::try_from("IC0000010203040000100").unwrap());
+        let msg = Message::parse(&pkt).unwrap().unwrap();
+        assert_eq!(
+            msg,
+            Message::SendCode(SendCode {
+                code: [0, 0, 1, 2, 3, 4],
+                user: 0,
+                keypad: Keypad::try_from(1).unwrap(),
             })
         );
         assert_eq!(msg.to_pkt(), pkt);

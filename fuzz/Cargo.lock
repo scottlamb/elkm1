@@ -47,6 +47,7 @@ dependencies = [
  "arbitrary",
  "bytes",
  "futures",
+ "log",
  "memchr",
  "pretty-hex",
  "tokio",

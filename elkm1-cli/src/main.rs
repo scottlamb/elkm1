@@ -5,8 +5,11 @@ use std::path::PathBuf;
 
 use bytes::BytesMut;
 use clap::Parser;
-use elkm1::{msg::NUM_AREAS, state::Change};
-use futures::StreamExt;
+use elkm1::{
+    msg::NUM_AREAS,
+    state::{Change, Command},
+};
+use futures::{SinkExt, StreamExt};
 use pretty_hex::PrettyHex;
 
 #[derive(Parser)]
