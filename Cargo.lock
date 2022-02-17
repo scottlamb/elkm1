@@ -200,12 +200,12 @@ name = "elkm1-mqtt"
 version = "0.0.1"
 dependencies = [
  "bytes",
- "clap",
  "elkm1",
  "env_logger",
  "futures",
  "log",
  "rumqttc",
+ "serde",
  "serde_json",
  "tokio",
 ]

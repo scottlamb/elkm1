@@ -32,57 +32,74 @@
 //!     *   [Switches](https://www.home-assistant.io/integrations/switch.mqtt/) for zone bypass.
 //!     *   [Buttons](https://www.home-assistant.io/integrations/button.mqtt/) for
 //!         automation tasks.
-//! *   Configuration file
-//!     *   MQTT / Elk configuration (currently command line options)
-//!     *   Map the Elk's (zone, area, task, etc.) numbers to MQTT topic names,
-//!         rather than solely relying on the 16-character names allowed by the
-//!         Elk.
 
-use clap::Parser;
+use std::path::PathBuf;
+
 use elkm1::state;
 use futures::StreamExt;
+use serde::Deserialize;
 
-#[derive(Parser)]
-struct Args {
-    #[clap(long)]
-    mqtt_id: String,
-
-    #[clap(long)]
-    mqtt_host: String,
-
-    #[clap(long, default_value_t = 1883)]
-    mqtt_port: u16,
-
-    #[clap(long)]
-    mqtt_username: Option<String>,
-
-    #[clap(long, requires = "mqtt-username")]
-    mqtt_password: Option<String>,
-
-    #[clap(long)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Config {
+    mqtt: Mqtt,
     elk_addr: String,
+}
+
+fn mqtt_default_port() -> u16 { 1883 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Mqtt {
+    #[serde(default)]
+    client_id: String,
+
+    host: String,
+
+    #[serde(default = "mqtt_default_port")]
+    port: u16,
+
+    username: Option<String>,
+    password: Option<String>,
+
+    topic_prefix: String,
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::new().default_filter_or("info")).init();
-    let args = Args::parse();
-    let mut mqtt_opts = rumqttc::MqttOptions::new(&args.mqtt_id, &args.mqtt_host, args.mqtt_port);
-    if let Some(mqtt_username) = args.mqtt_username {
-        mqtt_opts.set_credentials(mqtt_username, args.mqtt_password.unwrap());
+    let mut args = std::env::args_os();
+    let _ = args.next().expect("no argv[0]");
+    let config_path: PathBuf = args.next().unwrap().into();
+    if args.next().is_some() {
+        panic!("extra argument after config");
+    }
+    let config = std::fs::read(config_path).unwrap();
+    let config: Config = serde_json::from_slice(&config[..]).unwrap();
+
+
+    let mut mqtt_opts = rumqttc::MqttOptions::new(&config.mqtt.client_id, &config.mqtt.host, config.mqtt.port);
+    match (config.mqtt.username, config.mqtt.password) {
+        (Some(u), Some(p)) => {
+            mqtt_opts.set_credentials(u, p);
+        },
+        (None, None) => {},
+        _ => panic!("username without password or vice versa"),
     }
     mqtt_opts.set_last_will(rumqttc::LastWill {
-        topic: "elk/status".to_string(),
+        topic: format!("{}/status", &config.mqtt.topic_prefix),
         message: "disconnected".into(),
         qos: rumqttc::QoS::AtLeastOnce,
         retain: true,
     });
     let (mqtt_cli, mut mqtt_eventloop) = rumqttc::AsyncClient::new(mqtt_opts, 10);
-    let panel = state::Panel::connect(&args.elk_addr).await.unwrap();
-    mqtt_cli
-        .publish("elk/status", rumqttc::QoS::AtLeastOnce, true, "connected")
-        .await
-        .unwrap();
+    let panel = state::Panel::connect(&config.elk_addr).await.unwrap();
+    mqtt_cli.publish(
+        format!("{}/status", &config.mqtt.topic_prefix),
+        rumqttc::QoS::AtLeastOnce,
+        true,
+        "connected",
+    ).await.unwrap();
     tokio::pin!(panel);
     loop {
         tokio::select! {
