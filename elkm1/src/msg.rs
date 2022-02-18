@@ -369,7 +369,7 @@ byte_enum! {
 }
 
 /// A six-digit numeric arm code.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
 pub struct ArmCode([u8; 6]);
 
@@ -854,6 +854,13 @@ byte_enum! {
         WaterAlarm = b'@',
         FireSupervisory = b'A',
         VerifyFire = b'B',
+    }
+}
+
+impl AlarmState {
+    #[inline]
+    pub fn is_firing(self) -> bool {
+        self as u8 > AlarmState::FireAlarm as u8
     }
 }
 

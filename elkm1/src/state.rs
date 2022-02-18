@@ -162,11 +162,12 @@ impl Panel {
         self.conn.send(send.to_pkt()).await?;
         while let Some(received) = self.conn.next().await {
             let received = self.interpret(received?);
-            log::debug!("init_req: received {:#?}", &received);
             if let Some(Ok(r)) = &received.msg {
                 if r.is_response_to(&send) {
+                    log::debug!("init_req: completed by {:#?}", &received);
                     return Ok(received);
                 }
+                log::debug!("init_req: received unrelated {:#?}", &received);
             }
         }
         Err(std::io::Error::new(
