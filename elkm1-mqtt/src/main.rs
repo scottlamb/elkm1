@@ -187,6 +187,7 @@ async fn publish_zone_state(
 }
 
 /// [Home Assistant alarm control panel config](https://www.home-assistant.io/integrations/alarm_control_panel.mqtt/)
+/// https://developers.home-assistant.io/docs/core/entity/alarm-control-panel
 #[derive(Serialize)]
 struct HaAlarmPanelConfig<'a> {
     availability_topic: String,

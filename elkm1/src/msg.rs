@@ -8,7 +8,7 @@
 use arbitrary::Arbitrary;
 
 #[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Serialize};
 
 use std::str::FromStr;
 
@@ -163,6 +163,19 @@ messages! {
         keypad: Keypad,
     }
 
+    /// `rr`: request Real Time Clock Data.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
+    struct RtcRequest {
+    }
+
+    /// `RR`: Real Time Clock Data.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
+    struct RtcResponse {
+        rtc_data: RtcData,
+    }
+
     /// `sd`: Request ASCII String Text Descriptions.
     #[derive(Clone, Debug, PartialEq, Eq)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
@@ -192,6 +205,13 @@ messages! {
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
     struct TaskChange {
         pub task: Task,
+    }
+
+    /// `XK`: Control RTC Broadcast / IP Communications Device Test (a heartbeat).
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
+    struct Heartbeat {
+        rtc_data: RtcData,
     }
 
     /// `ZC`: Zone Change Update.
@@ -236,6 +256,8 @@ impl Message {
             b"AS" => ArmingStatusReport::from_ascii_data(data).map(Self::ArmingStatusReport),
             b"EE" => SendTimeData::from_ascii_data(data).map(Self::SendTimeData),
             b"IC" => SendCode::from_ascii_data(data).map(Self::SendCode),
+            b"rr" => RtcRequest::from_ascii_data(data).map(Self::RtcRequest),
+            b"RR" => RtcResponse::from_ascii_data(data).map(Self::RtcResponse),
             b"sd" => {
                 StringDescriptionRequest::from_ascii_data(data).map(Self::StringDescriptionRequest)
             }
@@ -243,6 +265,7 @@ impl Message {
                 .map(Self::StringDescriptionResponse),
             b"tn" => ActivateTask::from_ascii_data(data).map(Self::ActivateTask),
             b"TC" => TaskChange::from_ascii_data(data).map(Self::TaskChange),
+            b"XK" => Heartbeat::from_ascii_data(data).map(Self::Heartbeat),
             b"ZC" => ZoneChange::from_ascii_data(data).map(Self::ZoneChange),
             b"zs" => ZoneStatusRequest::from_ascii_data(data).map(Self::ZoneStatusRequest),
             b"ZS" => ZoneStatusReport::from_ascii_data(data).map(Self::ZoneStatusReport),
@@ -447,32 +470,61 @@ byte_enum! {
     }
 }
 
+byte_enum! {
+    /// Day of the week, as in `RR` and `XK` messages.
+    enum Weekday {
+        Sun = b'1',
+        Mon = b'2',
+        Tue = b'3',
+        Wed = b'4',
+        Thu = b'5',
+        Fri = b'6',
+        Sat = b'7',
+    }
+}
+
+byte_enum! {
+    /// Clock display mode: 24-hour or 12-hour.
+    enum ClockDisplayMode {
+        TwentyFourHour = b'0',
+        TwelveHour = b'1',
+    }
+}
+
+byte_enum! {
+    /// Date display mode: `mm/dd` or `dd/mm`.
+    enum DateDisplayMode {
+        MonthFirst = b'0',
+        DayFirst = b'1',
+    }
+}
 /// Creates a `u8` wrapper that enforces a range of `[1, $max]`.
 macro_rules! limited_u8 {
     (
-        #[doc=$enum_doc:literal]
+        #[doc=$doc:literal]
         $t:ident max=$max:literal
     ) => {
         #[repr(transparent)]
         #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+        #[doc=$doc]
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
         pub struct $t(u8);
 
         impl $t {
             pub fn to_index(self) -> usize {
-                self.0 as usize - 1
+                usize::from(self.0) - 1
             }
         }
 
         #[cfg(feature = "arbitrary")]
         impl Arbitrary<'_> for $t {
             fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-                let b = u.bytes(1)?[0];
+                let b: u8 = Arbitrary::from(u);
                 $t::try_from(b).map_err(|_| arbitrary::Error::IncorrectFormat)
             }
 
-            fn size_hint(_depth: usize) -> (usize, Option<usize>) {
-                (1, Some(1))
+            fn size_hint(depth: usize) -> (usize, Option<usize>) {
+                <u8 as Arbitrary>::size_hint(depth)
             }
         }
 
@@ -490,13 +542,14 @@ macro_rules! limited_u8 {
 
         impl TryFrom<u8> for $t {
             type Error = String;
+
             fn try_from(val: u8) -> Result<Self, Self::Error> {
                 if val < 1 || val > $max {
                     return Err(format!(
                         "{} not in expected {} range of [1, {}]",
                         val,
                         stringify!(t),
-                        $max
+                        $max,
                     ));
                 }
                 Ok(Self(val))
@@ -509,6 +562,202 @@ macro_rules! limited_u8 {
             }
         }
     };
+}
+
+/// A datetime, loosely defined.
+///
+/// This currently enforces the ranges mentioned in Elk's spec, e.g. day can't be more than 31.
+/// It doesn't use a real date library and thus doesn't prevent silly dates like February 30th.
+#[derive(Copy, Clone, PartialEq, Eq)]
+struct DateTime {
+    year: u8,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+}
+
+impl DateTime {
+    /// Parses an ISO 8601 datetime like `YYYY-mm-DDTHH:MM:SS`.
+    pub fn from_iso_8601(val: &str) -> Result<Self, String> {
+        if val.len() != 19 {
+            return Err("wrong length".to_owned());
+        }
+        let year = u16::from_str(&val[..4]).map_err(|_| "bad year".to_owned())?;
+        if year < 2000 || year > 2100 {
+            return Err(format!("year {} out of range", year));
+        }
+        if &val[4..5] != "-" {
+            return Err("bad year-month separator".to_owned());
+        }
+        let month = u8::from_str(&val[5..7]).map_err(|_| "bad month".to_owned())?;
+        if month < 1 || month > 12 {
+            return Err(format!("month {} out of range", month));
+        }
+        if &val[7..8] != "-" {
+            return Err("bad month-day separator".to_owned());
+        }
+        let day = u8::from_str(&val[8..10]).map_err(|_| "bad day".to_owned())?;
+        if day < 1 || day > 31 {
+            return Err(format!("day {} out of range", day));
+        }
+        if &val[10..11] != "T" {
+            return Err("bad date-time separator".to_owned());
+        }
+        let hour = u8::from_str(&val[11..13]).map_err(|_| "bad hour".to_owned())?;
+        if &val[13..14] != ":" {
+            return Err("bad hour-minute separator".to_owned());
+        }
+        if hour > 23 {
+            return Err(format!("hour {} out of range", hour));
+        }
+        let minute = u8::from_str(&val[14..16]).map_err(|_| "bad minute".to_owned())?;
+        if minute > 59 {
+            return Err(format!("minute {} out of range", minute));
+        }
+        if &val[16..17] != ":" {
+            return Err("bad minute-second separator".to_owned());
+        }
+        let second = u8::from_str(&val[17..19]).map_err(|_| "bad second".to_owned())?;
+        if second > 59 {
+            return Err("second out of range".to_owned());
+        }
+        Ok(Self {
+            year: (year - 2000) as u8,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+        })
+    }
+
+    pub fn to_iso_8601(&self) -> String {
+        format!(
+            "20{:02}-{:02}-{:02}T{:02}:{:02}:{:02}",
+            self.year, self.month, self.day, self.hour, self.minute, self.second
+        )
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for DateTime {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_iso_8601())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for DateTime {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s: &str = Deserialize::deserialize(deserializer)?;
+        Self::from_iso_8601(s).map_err(|_| {
+            D::Error::invalid_value(
+                serde::de::Unexpected::Str(s),
+                &"a datetime of the format YYYY-mm-ddTHH:MM:SS",
+            )
+        })
+    }
+}
+
+impl std::fmt::Debug for DateTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_iso_8601().fmt(f)
+    }
+}
+
+impl std::fmt::Display for DateTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.to_iso_8601().fmt(f)
+    }
+}
+
+/// Real-time clock date: datetime and flags.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+struct RtcData {
+    datetime: DateTime,
+    weekday: Weekday,
+    dst: bool,
+    clock_display: ClockDisplayMode,
+    date_display: DateDisplayMode,
+}
+
+impl RtcData {
+    fn from_ascii(data: &[u8]) -> Result<Self, String> {
+        if data.len() < 16 {
+            return Err("RTC data must be at least 16 bytes".to_owned());
+        }
+        let year = parse_u8_dec("year", &data[11..13])?;
+        debug_assert!(year < 100);
+        let month = parse_u8_dec("month", &data[9..11])?;
+        if month < 1 || month > 12 {
+            return Err("month out of range".to_owned());
+        }
+        let day = parse_u8_dec("day", &data[7..9])?;
+        if day < 1 || day > 31 {
+            return Err("day out of range".to_owned());
+        }
+        let hour = parse_u8_dec("hour", &data[4..6])?;
+        if hour >= 24 {
+            return Err("hour out of range".to_owned());
+        }
+        let minute = parse_u8_dec("minute", &data[2..4])?;
+        if minute >= 60 {
+            return Err("minute out of range".to_owned());
+        }
+        let second = parse_u8_dec("second", &data[0..2])?;
+        if second >= 60 {
+            return Err("second out of range".to_owned());
+        }
+        let weekday = Weekday::try_from(data[6])?;
+        let dst = match data[13] {
+            b'0' => false,
+            b'1' => true,
+            _ => return Err("bad dst flag".to_owned()),
+        };
+        let clock_display = ClockDisplayMode::try_from(data[14])?;
+        let date_display = DateDisplayMode::try_from(data[15])?;
+        Ok(Self {
+            datetime: DateTime {
+                year,
+                month,
+                day,
+                hour,
+                minute,
+                second,
+            },
+            weekday,
+            dst,
+            clock_display,
+            date_display,
+        })
+    }
+
+    fn to_ascii(&self) -> impl Iterator<Item = u8> {
+        format!(
+            "{:02}{:02}{:02}{:01}{:02}{:02}{:02}{:01}{:01}{:01}",
+            self.datetime.second,
+            self.datetime.minute,
+            self.datetime.hour,
+            self.weekday as u8 as char,
+            self.datetime.day,
+            self.datetime.month,
+            self.datetime.year,
+            if self.dst { 1 } else { 0 },
+            self.clock_display as u8 as char,
+            self.date_display as u8 as char,
+        )
+        .into_bytes()
+        .into_iter()
+    }
 }
 
 pub const NUM_AREAS: usize = 8;
@@ -986,6 +1235,37 @@ impl SendCode {
     }
 }
 
+impl RtcRequest {
+    fn from_ascii_data(_data: &[u8]) -> Result<Self, String> {
+        Ok(RtcRequest {})
+    }
+    fn to_ascii(&self) -> AsciiPacket {
+        AsciiPacket::try_from("rr00").expect("RtcResponse valid")
+    }
+    fn is_response_to(&self, _request: &Message) -> bool {
+        false
+    }
+}
+
+impl RtcResponse {
+    fn from_ascii_data(data: &[u8]) -> Result<Self, String> {
+        Ok(RtcResponse {
+            rtc_data: RtcData::from_ascii(data)?,
+        })
+    }
+    fn to_ascii(&self) -> AsciiPacket {
+        let msg: Vec<u8> = [b'R', b'R']
+            .iter()
+            .copied()
+            .chain(self.rtc_data.to_ascii())
+            .collect();
+        AsciiPacket::try_from(msg).expect("RtcResponse valid")
+    }
+    fn is_response_to(&self, request: &Message) -> bool {
+        matches!(request, Message::RtcRequest(_))
+    }
+}
+
 impl StringDescriptionRequest {
     fn from_ascii_data(data: &[u8]) -> Result<Self, String> {
         if data.len() < 5 {
@@ -1180,6 +1460,25 @@ impl TaskChange {
     }
 }
 
+impl Heartbeat {
+    fn from_ascii_data(data: &[u8]) -> Result<Self, String> {
+        Ok(Heartbeat {
+            rtc_data: RtcData::from_ascii(data)?,
+        })
+    }
+    fn to_ascii(&self) -> AsciiPacket {
+        let msg: Vec<u8> = [b'X', b'K']
+            .iter()
+            .copied()
+            .chain(self.rtc_data.to_ascii())
+            .collect();
+        AsciiPacket::try_from(msg).expect("Heartbeat valid")
+    }
+    fn is_response_to(&self, _request: &Message) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1323,5 +1622,23 @@ mod tests {
         assert!(!ArmingStatusReport::is_transition_suspicious(
             &armed, &disarmed
         ));
+    }
+
+    #[test]
+    fn rtc() {
+        const ENCODED: &[u8; 16] = b"0059107251205110";
+        let parsed = RtcData::from_ascii(ENCODED).unwrap();
+        assert_eq!(
+            parsed,
+            RtcData {
+                datetime: DateTime::from_iso_8601("2005-12-25T10:59:00").unwrap(),
+                weekday: Weekday::Sat,
+                dst: true,
+                clock_display: ClockDisplayMode::TwelveHour,
+                date_display: DateDisplayMode::MonthFirst,
+            },
+        );
+        let reencoded: Vec<u8> = parsed.to_ascii().collect();
+        assert_eq!(&ENCODED[..], &reencoded[..]);
     }
 }
