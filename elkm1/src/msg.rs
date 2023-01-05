@@ -107,6 +107,10 @@ macro_rules! messages {
 
 messages! {
     /// `aL`: Arm/Disarm Request.
+    ///
+    /// For arming to succeed, the supplied `code` must belong to a user which does *not* have the
+    /// `Access` permission, as noted in [this issue
+    /// comment](https://github.com/BioSehnsucht/ha-elkm1/issues/23#issuecomment-414145743).
     #[derive(Clone, Debug, PartialEq, Eq)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
     struct ArmRequest {
