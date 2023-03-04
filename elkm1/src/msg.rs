@@ -1319,6 +1319,12 @@ impl TextDescription {
     }
 }
 
+impl std::fmt::Display for TextDescription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.as_str(), f)
+    }
+}
+
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct TextDescriptions<const N: usize>(pub [TextDescription; N]);
 
@@ -1370,12 +1376,6 @@ impl Default for TextDescription {
 impl std::fmt::Debug for TextDescription {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Debug::fmt(&**self, f)
-    }
-}
-
-impl std::fmt::Display for TextDescription {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&**self, f)
     }
 }
 

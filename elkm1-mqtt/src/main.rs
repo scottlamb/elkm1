@@ -341,9 +341,22 @@ async fn run_eventloop(
     }
 }
 
+fn setup_tracing() {
+    use tracing_subscriber::prelude::*;
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+        .from_env_lossy();
+    let sub = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::Layer::new()
+            .with_thread_names(true)
+            .with_filter(filter),
+    );
+    tracing::subscriber::set_global_default(sub).unwrap();
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    env_logger::Builder::from_env(env_logger::Env::new().default_filter_or("info")).init();
+    setup_tracing();
     let mut args = std::env::args_os();
     let _ = args.next().expect("no argv[0]");
     let cfg_path: PathBuf = args.next().unwrap().into();

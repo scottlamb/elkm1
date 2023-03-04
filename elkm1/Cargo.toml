@@ -16,12 +16,12 @@ readme = "../README.md"
 arbitrary = { version = "1", features = ["derive"], optional = true }
 bytes = "1.1.0"
 futures = "0.3.14"
-log = "0.4.14"
 memchr = "2.4.1"
 pretty-hex = "0.2.1"
 serde = { version  = "1.0.136", features = ["derive"], optional = true }
 tokio = { version = "1.16.1", features = ["net", "time"], optional = true }
 tokio-util = { version = "0.6.6", features = ["codec"], optional = true }
+tracing = "0.1.37"
 
 [dev-dependencies]
 pretty_assertions = "1.1.0"

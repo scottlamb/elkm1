@@ -17,18 +17,18 @@ enum Cmd {
 
 async fn watch(addr: String) {
     let panel = state::Panel::connect(&addr).await.unwrap();
-    log::info!("Tracking changes.");
+    tracing::info!("tracking changes");
     tokio::pin!(panel);
     while let Some(pkt) = panel.next().await {
         let pkt = pkt.unwrap();
-        log::debug!("received {:#?}", &pkt);
+        tracing::debug!(?pkt, "received packet");
         match pkt.change {
             Some(state::Change::ZoneChange { zone, prior }) => {
-                log::info!(
-                    "{}: {:?} -> {:?}",
-                    panel.zone_name(zone),
-                    prior,
-                    panel.zone_statuses().zones[zone.to_index()],
+                tracing::info!(
+                    zone.name = %panel.zone_name(zone),
+                    prior.state = ?prior,
+                    new.state = ?panel.zone_statuses().zones[zone.to_index()],
+                    "zone change"
                 );
             }
             Some(state::Change::ArmingStatus { prior }) => {
@@ -39,15 +39,15 @@ async fn watch(addr: String) {
                         || prior.up_state[i] != cur.up_state[i]
                         || prior.alarm_state[i] != cur.alarm_state[i]
                     {
-                        log::info!(
-                            "{}: {:?} {:?} {:?} -> {:?} {:?} {:?}",
-                            area_names[i],
-                            prior.arming_status[i],
-                            prior.up_state[i],
-                            prior.alarm_state[i],
-                            cur.arming_status[i],
-                            cur.up_state[i],
-                            cur.alarm_state[i],
+                        tracing::info!(
+                            area.name = %area_names[i],
+                            prior.arming_status = ?prior.arming_status[i],
+                            prior.up_state = ?prior.up_state[i],
+                            prior.alarm_state = ?prior.alarm_state[i],
+                            new.arming_status = ?cur.arming_status[i],
+                            new.up_state = ?cur.up_state[i],
+                            new.alarm_state = ?cur.alarm_state[i],
+                            "arming status change",
                         );
                     }
                 }
@@ -68,9 +68,22 @@ fn read(filename: PathBuf) {
     }
 }
 
+fn setup_tracing() {
+    use tracing_subscriber::prelude::*;
+    let filter = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+        .from_env_lossy();
+    let sub = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::Layer::new()
+            .with_thread_names(true)
+            .with_filter(filter),
+    );
+    tracing::subscriber::set_global_default(sub).unwrap();
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    env_logger::Builder::from_env(env_logger::Env::new().default_filter_or("info")).init();
+    setup_tracing();
     match Cmd::parse() {
         Cmd::Watch { addr } => watch(addr).await,
         Cmd::Read { filename } => read(filename),

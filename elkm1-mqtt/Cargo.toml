@@ -11,10 +11,11 @@ readme = "../README.md"
 [dependencies]
 bytes = "1.1.0"
 elkm1 = { path = "../elkm1", features = ["serde", "tokio"] }
-env_logger = "0.9.0"
 futures = "0.3.14"
 log = "0.4.14"
 rumqttc = "0.10.0"
 serde = { version  = "1.0.136", features = ["derive"] }
 serde_json = "1.0.79"
 tokio = { version = "1.16.1", features = ["macros", "rt", "sync"] }
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3.16", features = ["env-filter", "local-time"] }

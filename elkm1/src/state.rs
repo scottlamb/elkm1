@@ -131,6 +131,7 @@ impl Panel {
             .expect("zone_status is set post-init")
     }
 
+    #[tracing::instrument(name = "initialization", skip_all)]
     async fn with_connection(conn: Connection) -> Result<Self, std::io::Error> {
         let mut this = Panel {
             conn,
@@ -158,16 +159,16 @@ impl Panel {
     ///
     /// Processes but doesn't report any other messages received while waiting.
     async fn init_req(&mut self, send: Message) -> Result<Event, std::io::Error> {
-        log::debug!("init_req: sending {:#?}", &send);
+        tracing::debug!(msg = ?send, "sending initialization message");
         self.conn.send(send.to_pkt()).await?;
         while let Some(received) = self.conn.next().await {
             let received = self.interpret(received?);
             if let Some(Ok(r)) = &received.msg {
                 if r.is_response_to(&send) {
-                    log::debug!("init_req: completed by {:#?}", &received);
+                    tracing::debug!(msg = ?received, "received reply");
                     return Ok(received);
                 }
-                log::debug!("init_req: received unrelated {:#?}", &received);
+                tracing::debug!(msg = ?received, "received unrelated message while awaiting reply");
             }
         }
         Err(std::io::Error::new(
@@ -271,20 +272,19 @@ impl Panel {
         // transition within a reasonable time.
         if let Some((_, pending)) = self.pending_arm.take() {
             if msg::ArmingStatusReport::is_transition_suspicious(prior, msg) {
-                log::warn!(
+                tracing::warn!(
+                    ?prior,
+                    ?pending,
+                    new = ?msg,
                     "next arming report after suspicious transition is also suspicious; \
-                     applying anyway\nprior: {:#?}\npending: {:#?}\nnew: {:#?}",
-                    prior,
-                    &pending,
-                    &msg,
+                    applying anyway",
                 );
             }
         } else if msg::ArmingStatusReport::is_transition_suspicious(prior, msg) {
-            log::debug!(
-                "Delaying arming status transition suspected to be spurious.\n\
-                 prior: {:#?}\npending: {:#?}",
-                prior,
-                msg,
+            tracing::debug!(
+                ?prior,
+                pending = ?msg,
+                "delaying arming status transition suspected to be spurious",
             );
             self.pending_arm = Some((
                 Box::pin(tokio::time::sleep(SUSPICIOUS_TRANSITION_DELAY)),
@@ -320,7 +320,7 @@ impl Stream for Panel {
             Poll::Pending => {}
         }
 
-        if let Some((s, a)) = this.pending_arm.as_mut() {
+        if let Some((s, pending)) = this.pending_arm.as_mut() {
             if s.as_mut().poll(cx).is_ready() {
                 let prior = this
                     .state
@@ -332,13 +332,8 @@ impl Stream for Panel {
                     change: Some(Change::ArmingStatus { prior }),
                     completes: None,
                 };
-                log::warn!(
-                    "Deferred arming status taking effect.\n\
-                     prior: {:?}\npending: {:?}\n",
-                    prior,
-                    a,
-                );
-                this.state.arming_status = Some(*a);
+                tracing::warn!(?prior, ?pending, "deferred arming status taking effect",);
+                this.state.arming_status = Some(*pending);
                 this.pending_arm.take();
                 return Poll::Ready(Some(Ok(event)));
             }
@@ -384,7 +379,7 @@ impl Sink<Command> for Panel {
         let this = Pin::into_inner(self);
         assert!(matches!(this.cmd_state, CmdState::Idle));
         let msg = item.into_msg();
-        log::debug!("Sending {:?}", &msg);
+        tracing::debug!(?msg, "sending message");
         this.conn.start_send_unpin(msg.to_pkt())?;
         this.cmd_state = CmdState::Busy {
             request: msg,

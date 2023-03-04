@@ -58,7 +58,7 @@ impl Sink<Packet> for Connection {
         mut self: Pin<&mut Self>,
         item: Packet,
     ) -> Result<(), <Self as futures::Sink<Packet>>::Error> {
-        log::debug!("sending {:?}", item);
+        tracing::debug!(pkt = ?item, "sending packet");
         self.0.start_send_unpin(item)
     }
 
