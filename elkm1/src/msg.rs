@@ -3,6 +3,16 @@
 
 //! Message layer: statelessly converts [`crate::pkt`] packets into higher-level
 //! messages and vice versa.
+//!
+//! Message types are written to have some general properties:
+//!
+//! *   They can only represent valid messages at the type level. Ranges of
+//!     certain values are enforced via dedicated types.
+//! *   Serializing and deserializing a message should always produce an
+//!     equal message.
+//! *   When using the `arbitrary` cargo feature, they implement `Arbitrary`.
+//! *   They may be converted to a general [`Message`] (an enum of all message
+//!     types) or a [`crate::pkt::Packet`].
 
 #[cfg(feature = "arbitrary")]
 use arbitrary::Arbitrary;
@@ -224,11 +234,11 @@ ascii_messages! {
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
     struct SystemTroubleStatusResponse {
         pub ac_fail: bool,
-        pub box_tamper: Option<Zone>,
+        pub box_tamper: ZoneTrouble,
         pub fail_to_communicate: bool,
         pub eeprom_memory_error: bool,
         pub control_low_battery: bool,
-        pub transmitter_low_battery: Option<Zone>,
+        pub transmitter_low_battery: ZoneTrouble,
         pub over_current_trouble: bool,
         pub telephone_fault_trouble: bool,
         pub output_2_trouble: bool,
@@ -238,14 +248,14 @@ ascii_messages! {
         pub elkrp_remote_access: bool,
         pub common_area_not_armed: bool,
         pub flash_memory_error: bool,
-        pub security_alert: Option<Zone>,
+        pub security_alert: ZoneTrouble,
         pub serial_port_expander: bool,
-        pub lost_transmitter: Option<Zone>,
+        pub lost_transmitter: ZoneTrouble,
         pub ge_smoke_cleanme: bool,
         pub ethernet: bool,
         pub display_message_keypad_line1: bool,
         pub display_message_keypad_line2: bool,
-        pub fire: Option<Zone>,
+        pub fire: ZoneTrouble,
     }
 
     /// `tn`: Task Activation.
@@ -582,14 +592,31 @@ macro_rules! limited_u8 {
         #[repr(transparent)]
         #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
         #[doc=$doc]
-        #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
+        #[cfg_attr(feature = "serde", derive(Serialize), serde(transparent))]
         pub struct $t(NonZeroU8);
 
         impl $t {
             pub const MAX: usize = $max;
 
+            #[inline]
             pub fn to_index(self) -> usize {
                 usize::from(self.0.get()) - 1
+            }
+        }
+
+        #[cfg(feature = "serde")]
+        impl<'de> Deserialize<'de> for $t {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = u8::deserialize(deserializer)?;
+                if !(1..=$max).contains(&value) {
+                    return Err(D::Error::custom(format!("value out of range: {}", value)));
+                }
+                Ok($t(
+                    NonZeroU8::new(value).expect("value should be verified as non-zero")
+                ))
             }
         }
 
@@ -608,12 +635,14 @@ macro_rules! limited_u8 {
         }
 
         impl std::fmt::Debug for $t {
+            #[inline]
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 std::fmt::Debug::fmt(&self.0, f)
             }
         }
 
         impl std::fmt::Display for $t {
+            #[inline]
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 std::fmt::Display::fmt(&self.0, f)
             }
@@ -636,6 +665,7 @@ macro_rules! limited_u8 {
         }
 
         impl From<$t> for u8 {
+            #[inline]
             fn from(value: $t) -> u8 {
                 value.0.get()
             }
@@ -726,7 +756,7 @@ impl Arbitrary<'_> for DateTime {
         Ok(Self {
             year: u.int_in_range(0..=99)?,
             month: u.int_in_range(1..=12)?,
-            day: u.int_in_range(0..=31)?,
+            day: u.int_in_range(1..=31)?,
             hour: u.int_in_range(0..=23)?,
             minute: u.int_in_range(0..=59)?,
             second: u.int_in_range(0..=59)?,
@@ -1603,11 +1633,11 @@ impl SystemTroubleStatusResponse {
             ));
         }
         let ac_fail = parse_bool(data[0], "ac_fail")?;
-        let box_tamper = parse_zone_trouble(data[1], "box_tamper")?;
+        let box_tamper = ZoneTrouble::parse(data[1], "box_tamper")?;
         let fail_to_communicate = parse_bool(data[2], "fail_to_communicate")?;
         let eeprom_memory_error = parse_bool(data[3], "eeprom_memory_error")?;
         let control_low_battery = parse_bool(data[4], "control_low_battery")?;
-        let transmitter_low_battery = parse_zone_trouble(data[5], "transmitter_low_battery")?;
+        let transmitter_low_battery = ZoneTrouble::parse(data[5], "transmitter_low_battery")?;
         let over_current_trouble = parse_bool(data[6], "over_current_trouble")?;
         let telephone_fault_trouble = parse_bool(data[7], "telephone_fault_trouble")?;
         // data[8] is unused
@@ -1620,15 +1650,15 @@ impl SystemTroubleStatusResponse {
         // data[15] is not used
         let common_area_not_armed = parse_bool(data[16], "common_area_not_armed")?;
         let flash_memory_error = parse_bool(data[17], "flash_memory_error")?;
-        let security_alert = parse_zone_trouble(data[18], "security_alert")?;
+        let security_alert = ZoneTrouble::parse(data[18], "security_alert")?;
         let serial_port_expander = parse_bool(data[19], "serial_port_expander")?;
-        let lost_transmitter = parse_zone_trouble(data[20], "lost_transmitter")?;
+        let lost_transmitter = ZoneTrouble::parse(data[20], "lost_transmitter")?;
         let ge_smoke_cleanme = parse_bool(data[21], "ge_smoke_cleanme")?;
         let ethernet = parse_bool(data[22], "ethernet")?;
         // data[23..=30] are not used.
         let display_message_keypad_line1 = parse_bool(data[31], "display_message_keypad_line1")?;
         let display_message_keypad_line2 = parse_bool(data[32], "display_message_keypad_line2")?;
-        let fire = parse_zone_trouble(data[33], "fire")?; // TODO: different?
+        let fire = ZoneTrouble::parse(data[33], "fire")?; // TODO: different?
         Ok(SystemTroubleStatusResponse {
             ac_fail,
             box_tamper,
@@ -1661,11 +1691,11 @@ impl SystemTroubleStatusResponse {
                 b'S',
                 b'S',
                 fmt_bool(self.ac_fail),
-                fmt_zone_trouble(self.box_tamper),
+                self.box_tamper.fmt(),
                 fmt_bool(self.fail_to_communicate),
                 fmt_bool(self.eeprom_memory_error),
                 fmt_bool(self.control_low_battery),
-                fmt_zone_trouble(self.transmitter_low_battery),
+                self.transmitter_low_battery.fmt(),
                 fmt_bool(self.over_current_trouble),
                 fmt_bool(self.telephone_fault_trouble),
                 b'0',
@@ -1678,9 +1708,9 @@ impl SystemTroubleStatusResponse {
                 b'0',
                 fmt_bool(self.common_area_not_armed),
                 fmt_bool(self.flash_memory_error),
-                fmt_zone_trouble(self.security_alert),
+                self.security_alert.fmt(),
                 fmt_bool(self.serial_port_expander),
-                fmt_zone_trouble(self.lost_transmitter),
+                self.lost_transmitter.fmt(),
                 fmt_bool(self.ge_smoke_cleanme),
                 fmt_bool(self.ethernet),
                 b'0',
@@ -1693,7 +1723,7 @@ impl SystemTroubleStatusResponse {
                 b'0',
                 fmt_bool(self.display_message_keypad_line1),
                 fmt_bool(self.display_message_keypad_line2),
-                fmt_zone_trouble(self.fire),
+                self.fire.fmt(),
                 b'0',
                 b'0',
             ][..],
@@ -1705,16 +1735,84 @@ impl SystemTroubleStatusResponse {
     }
 }
 
-fn parse_zone_trouble(data: u8, which: &str) -> Result<Option<Zone>, String> {
-    Ok(NonZeroU8::new(
+/// Represents an optional zone number that is in trouble.
+///
+/// This is meant to be like an `Option<Zone>`, but the Elk protocol has an
+/// off-by-one error. Zone trouble is communicated in `SS` as `b'0' +
+/// zone_number`, and so the maximum zone of 208 doesn't fit in a byte. To
+/// maintain our property that all messages round-trip successfully (and
+/// certainly without panicking due to out-of-range condition), we have this
+/// dedicated type which doesn't allow zone 208. I have no idea how the Elk
+/// would handle trouble with that zone, but it seems worth avoiding that zone
+/// number if possible...
+#[derive(Copy, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+pub struct ZoneTrouble(u8);
+
+impl ZoneTrouble {
+    pub fn none() -> Self {
+        ZoneTrouble(0)
+    }
+
+    pub fn get(self) -> Option<Zone> {
+        NonZeroU8::new(self.0).map(Zone)
+    }
+
+    fn parse(data: u8, which: &str) -> Result<Self, String> {
         data.checked_sub(b'0')
-            .ok_or_else(|| format!("invalid {which} zone trouble byte"))?,
-    )
-    .map(Zone))
+            .map(ZoneTrouble)
+            .ok_or_else(|| format!("invalid {which} zone trouble byte"))
+    }
+
+    fn fmt(&self) -> u8 {
+        self.0 + b'0'
+    }
 }
 
-fn fmt_zone_trouble(zone: Option<Zone>) -> u8 {
-    zone.map(u8::from).unwrap_or(0) + b'0'
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for ZoneTrouble {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <Option<u8> as Deserialize>::deserialize(deserializer)?;
+        match value {
+            None => Ok(Self(0)),
+            Some(value) if !(1..=207).contains(&value) => {
+                Err(D::Error::custom(format!("value out of range: {}", value)))
+            }
+            Some(value) => Ok(Self(value)),
+        }
+    }
+}
+
+impl std::fmt::Debug for ZoneTrouble {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.get(), f)
+    }
+}
+
+impl TryFrom<u8> for ZoneTrouble {
+    type Error = String;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if !(1..208).contains(&value) {
+            return Err(format!("invalid zone {value} for trouble message"));
+        }
+        Ok(ZoneTrouble(value))
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+impl Arbitrary<'_> for ZoneTrouble {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
+        u.int_in_range(1..=207).map(Self)
+    }
+
+    fn size_hint(depth: usize) -> (usize, Option<usize>) {
+        let _ = depth;
+        (1, Some(1))
+    }
 }
 
 impl ActivateTask {
@@ -1939,7 +2037,7 @@ mod tests {
             Message::SystemTroubleStatusResponse(SystemTroubleStatusResponse {
                 output_2_trouble: true,
                 display_message_keypad_line1: true,
-                fire: Some(Zone::try_from(17).expect("17 should be a valid zone")),
+                fire: ZoneTrouble::try_from(17).expect("17 should be a valid zone"),
                 ..Default::default()
             })
         );
@@ -2004,5 +2102,24 @@ mod tests {
         );
         let reencoded: Vec<u8> = parsed.to_ascii().collect();
         assert_eq!(&ENCODED[..], &reencoded[..]);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn deserialize_limited() {
+        assert_eq!(
+            ZoneTrouble(0),
+            serde_json::from_str::<ZoneTrouble>("null").unwrap()
+        );
+        assert_eq!(
+            ZoneTrouble(207),
+            serde_json::from_str::<ZoneTrouble>("207").unwrap()
+        );
+        serde_json::from_str::<ZoneTrouble>("208").unwrap_err();
+        assert_eq!(
+            Zone::try_from(208).unwrap(),
+            serde_json::from_str::<Zone>("208").unwrap()
+        );
+        serde_json::from_str::<Zone>("255").unwrap_err();
     }
 }
