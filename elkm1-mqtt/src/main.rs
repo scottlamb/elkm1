@@ -285,7 +285,7 @@ async fn handle_publish(
     panel: &mut elkm1::state::Panel,
     publish: rumqttc::Publish,
 ) {
-    log::info!("publish: {:#?}: {:?}", &publish, &publish.payload);
+    tracing::info!(?publish, payload = ?publish.payload, "received mqtt publish");
 
     // TODO: better topic name matching.
     for (&area_id, area_cfg) in areas {
@@ -294,10 +294,10 @@ async fn handle_publish(
             continue;
         }
 
-        log::info!(
-            "area {}, payload {:?}",
-            &area_cfg.name,
-            &publish.payload[..]
+        tracing::info!(
+            area.name = %area_cfg.name,
+            publish.topic,
+            "matched to known area",
         );
         let ha_level = std::str::from_utf8(&publish.payload[..]).unwrap();
         let level = match ha_level {
@@ -305,7 +305,7 @@ async fn handle_publish(
             "ARM_AWAY" => elkm1::msg::ArmLevel::ArmedAway,
             "ARM_HOME" => elkm1::msg::ArmLevel::ArmedStay,
             _ => {
-                log::warn!("unknown level {:?}", &ha_level);
+                tracing::warn!(ha_level, "ignoring unknown level");
                 return;
             }
         };
@@ -323,7 +323,7 @@ async fn handle_publish(
 
         return;
     }
-    log::warn!("unknown topic {}", &publish.topic);
+    tracing::warn!(publish.topic, "ignoring publish to unknown topic");
 }
 
 async fn run_eventloop(
@@ -332,7 +332,7 @@ async fn run_eventloop(
 ) {
     loop {
         let notification = eventloop.poll().await.unwrap();
-        log::debug!("mqtt notification: {:#?}", &notification);
+        tracing::trace!(?notification, "mqtt notification");
 
         if let rumqttc::Event::Incoming(rumqttc::Packet::Publish(p)) = notification {
             tx.send(p).unwrap();
@@ -343,12 +343,15 @@ async fn run_eventloop(
 
 fn setup_tracing() {
     use tracing_subscriber::prelude::*;
+    tracing_log::LogTracer::init().unwrap();
     let filter = tracing_subscriber::EnvFilter::builder()
         .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
         .from_env_lossy();
     let sub = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::Layer::new()
+            .map_fmt_fields(|f| f.debug_alt())
             .with_thread_names(true)
+            .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
             .with_filter(filter),
     );
     tracing::subscriber::set_global_default(sub).unwrap();
@@ -356,6 +359,11 @@ fn setup_tracing() {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // SAFETY: let's assume nothing touches environment variables.
+    unsafe {
+        time::util::local_offset::set_soundness(time::util::local_offset::Soundness::Unsound);
+    }
+
     setup_tracing();
     let mut args = std::env::args_os();
     let _ = args.next().expect("no argv[0]");
@@ -389,7 +397,7 @@ async fn main() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(run_eventloop(mqtt_eventloop, tx));
     let panel = state::Panel::connect(&cfg.elk.host_port).await.unwrap();
-    log::info!("Panel initialized.");
+    tracing::info!("panel initialized");
     let code = elkm1::msg::ArmCode::try_from(cfg.elk.code).unwrap();
     if let Some(ha_discovery_prefix) = cfg.mqtt.ha_discovery_prefix {
         publish_ha_discovery(&mqtt_cli, &topic_prefix, &ha_discovery_prefix, &cfg.elk).await;
@@ -418,7 +426,7 @@ async fn main() {
         tokio::select! {
             panel_event = panel.next() => {
                 let panel_event = panel_event.unwrap().unwrap();
-                log::info!("panel event: {:#?}", &panel_event);
+                tracing::info!(?panel_event, "panel event");
                 mqtt_cli.publish(
                     format!("{}/event", &topic_prefix),
                     rumqttc::QoS::AtLeastOnce,

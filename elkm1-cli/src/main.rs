@@ -70,12 +70,15 @@ fn read(filename: PathBuf) {
 
 fn setup_tracing() {
     use tracing_subscriber::prelude::*;
+    tracing_log::LogTracer::init().unwrap();
     let filter = tracing_subscriber::EnvFilter::builder()
         .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
         .from_env_lossy();
     let sub = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::Layer::new()
+            .map_fmt_fields(|f| f.debug_alt())
             .with_thread_names(true)
+            .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
             .with_filter(filter),
     );
     tracing::subscriber::set_global_default(sub).unwrap();
@@ -83,6 +86,11 @@ fn setup_tracing() {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // SAFETY: let's assume nothing touches environment variables.
+    unsafe {
+        time::util::local_offset::set_soundness(time::util::local_offset::Soundness::Unsound);
+    }
+
     setup_tracing();
     match Cmd::parse() {
         Cmd::Watch { addr } => watch(addr).await,

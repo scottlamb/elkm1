@@ -182,8 +182,10 @@ dependencies = [
  "futures",
  "log",
  "pretty-hex",
+ "time",
  "tokio",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
 ]
 
@@ -194,12 +196,13 @@ dependencies = [
  "bytes",
  "elkm1",
  "futures",
- "log",
  "rumqttc",
  "serde",
  "serde_json",
+ "time",
  "tokio",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
 ]
 

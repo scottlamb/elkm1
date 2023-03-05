@@ -39,7 +39,11 @@ impl Stream for Connection {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.0.poll_next_unpin(cx)
+        let r = self.0.poll_next_unpin(cx);
+        if let Poll::Ready(Some(Ok(ref pkt))) = r {
+            tracing::trace!(?pkt, "received packet");
+        }
+        r
     }
 }
 
@@ -58,7 +62,7 @@ impl Sink<Packet> for Connection {
         mut self: Pin<&mut Self>,
         item: Packet,
     ) -> Result<(), <Self as futures::Sink<Packet>>::Error> {
-        tracing::debug!(pkt = ?item, "sending packet");
+        tracing::trace!(pkt = ?item, "sending packet");
         self.0.start_send_unpin(item)
     }
 
