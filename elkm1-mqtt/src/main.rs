@@ -37,83 +37,9 @@ use std::{collections::HashMap, path::PathBuf};
 
 use elkm1::state;
 use futures::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Cfg {
-    elk: ElkCfg,
-    mqtt: MqttCfg,
-}
-
-fn mqtt_default_port() -> u16 {
-    1883
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MqttCfg {
-    // TODO: default to `elkm1/{id}` instead?
-    #[serde(default)]
-    client_id: String,
-
-    host: String,
-
-    #[serde(default = "mqtt_default_port")]
-    port: u16,
-
-    username: Option<String>,
-    password: Option<String>,
-
-    /// The MQTT topic prefix. Defaults to `elkm1/{id}`.
-    topic_prefix: Option<String>,
-
-    /// The Home Assistant discovery prefix; omit to not publish.
-    ///
-    /// Typically should be `homeassistant`.
-    ha_discovery_prefix: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ElkCfg {
-    /// The Elk's serial number, as shown in ElkRP.
-    ///
-    /// Unfortunately there's no obvious way to learn this from the Elk's ASCII
-    /// protocol.
-    ///
-    /// This is used as the basis for
-    /// [`unique_id`](https://developers.home-assistant.io/docs/entity_registry_index#unique-id-requirements)s
-    /// in Home Assistant integration.
-    serial_number: String,
-
-    /// A fixed code for arm/disarm commands.
-    code: u32,
-
-    /// The Elk M1XEP's hostport, e.g. `elk:2101`.
-    host_port: String,
-
-    areas: HashMap<u8, AreaCfg>,
-    zones: HashMap<u8, ZoneCfg>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AreaCfg {
-    /// A name which is used in the MQTT topic name and HA unique_id for this area.
-    name: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ZoneCfg {
-    /// A name which is used in the MQTT topic name and HA unique_id for this zone.
-    name: String,
-
-    /// https://developers.home-assistant.io/docs/core/entity/binary-sensor
-    /// eg `door`, `window`, `motion`, `garage_door`
-    binary_sensor_device_class: String,
-}
+mod config;
 
 /// Returns an area's state in the enumeration format expected by the Home Assistant alarm
 /// panel platform.
@@ -145,7 +71,7 @@ async fn publish_area_states(
     mqtt_cli: &rumqttc::AsyncClient,
     panel: &elkm1::state::Panel,
     topic_prefix: &str,
-    areas: &HashMap<u8, AreaCfg>,
+    areas: &HashMap<u8, config::Area>,
 ) {
     for (&area_id, area_cfg) in areas {
         let area = elkm1::msg::Area::try_from(area_id).unwrap();
@@ -166,7 +92,7 @@ async fn publish_zone_state(
     panel: &elkm1::state::Panel,
     topic_prefix: &str,
     zone: elkm1::msg::Zone,
-    zone_cfg: &ZoneCfg,
+    zone_cfg: &config::Zone,
 ) {
     let zone_status = panel.zone_statuses().zones[zone.to_index()];
     let ha_status = match zone_status.logical() {
@@ -224,7 +150,7 @@ async fn publish_ha_discovery(
     mqtt_cli: &rumqttc::AsyncClient,
     topic_prefix: &str,
     ha_discovery_prefix: &str,
-    elk_cfg: &ElkCfg,
+    elk_cfg: &config::Elk,
 ) {
     let device = HaDeviceConfig {
         manufacturer: "Elk Products",
@@ -280,7 +206,7 @@ async fn publish_ha_discovery(
 
 async fn handle_publish(
     topic_prefix: &str,
-    areas: &HashMap<u8, AreaCfg>,
+    areas: &HashMap<u8, config::Area>,
     code: elkm1::msg::ArmCode,
     panel: &mut elkm1::state::Panel,
     publish: rumqttc::Publish,
@@ -372,7 +298,7 @@ async fn main() {
         panic!("extra argument after cfg");
     }
     let cfg = std::fs::read(cfg_path).unwrap();
-    let cfg: Cfg = serde_json::from_slice(&cfg[..]).unwrap();
+    let cfg: config::ConfigFile = serde_json::from_slice(&cfg[..]).unwrap();
 
     let mut mqtt_opts =
         rumqttc::MqttOptions::new(&cfg.mqtt.client_id, &cfg.mqtt.host, cfg.mqtt.port);
