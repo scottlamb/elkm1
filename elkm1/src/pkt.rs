@@ -3,6 +3,8 @@
 
 //! Lowest protocol layer: framing and unframing packets.
 
+use std::fmt::Write;
+
 use bytes::{Buf as _, BufMut, BytesMut};
 use pretty_hex::PrettyHex as _;
 
@@ -162,7 +164,7 @@ impl PartialEq for InvalidPacket {
     }
 }
 
-/// An ASCII packet.
+/// A (mostly) ASCII packet.
 ///
 /// The `Deref<[u8]>` and [`TryFrom`] impls deal with the body (not the framing).
 ///
@@ -185,12 +187,10 @@ impl PartialEq for InvalidPacket {
 /// *   `CC`: message checksum
 /// *   `(CR-LF)`: line ending
 ///
-/// Every `AsciiPacket`'s body meets the follow constraints:
-///
-/// * contains only printable ASCII characters.
-/// * has length within \[2, 253\], as required by the framing:
-///   * all messages must start with message type and subtype bytes.
-///   * the message length (of the included bytes and the checksum) must fit in 2 hexadigits.
+/// These packets are *mostly* ASCII. There are at least a couple exceptions:
+/// *   `SD` messages set the high bit of the first character to indicate the
+///     "Show On Keypad" bit.
+/// *   `SS` messages indicate zones with non-ASCII bytes.
 ///
 /// TODO: the Elk spec for `SD` says "The high bit of the first character in the
 /// text string may be set as the “Show On Keypad” bit. Mask out the high bit
@@ -198,9 +198,23 @@ impl PartialEq for InvalidPacket {
 /// rather than actually expecting all these messages to be ASCII.
 ///
 /// To decode a framed packet, see [`Packet::decode`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
-pub struct AsciiPacket(String);
+pub struct AsciiPacket(Vec<u8>);
+
+impl std::fmt::Debug for AsciiPacket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AsciiPacket(\"")?;
+        for &b in &self.0 {
+            if (b & 0x80) != 0 {
+                write!(f, "\\x{b:02X}")?;
+            } else {
+                f.write_char(b as char)?;
+            }
+        }
+        write!(f, "\")")
+    }
+}
 
 impl AsciiPacket {
     /// Decodes a framed packet.
@@ -228,10 +242,9 @@ impl AsciiPacket {
     fn encode(&self, to: &mut BytesMut) {
         to.reserve(6 + self.len());
         let encoded_len = Self::hex_byte(2 + self.0.len() as u8);
-        let checksum =
-            Self::checksum(&encoded_len[..]).wrapping_add(Self::checksum(self.as_bytes()));
+        let checksum = Self::checksum(&encoded_len[..]).wrapping_add(Self::checksum(self));
         to.put_slice(&encoded_len[..]);
-        to.put_slice(self.0.as_bytes());
+        to.put_slice(&self.0);
         to.put_slice(&Self::hex_byte(checksum)[..]);
         to.put_slice(b"\r\n");
     }
@@ -272,10 +285,10 @@ impl AsciiPacket {
         [Self::hex_nibble(byte >> 4), Self::hex_nibble(byte)]
     }
 
-    /// Checks that `data` contains only printable ASCII characters.
-    pub(crate) fn check_printable(value: &[u8]) -> Result<(), String> {
-        if let Some(i) = value.iter().position(|&b| b < 0x20 || b > 0x7e) {
-            return Err(format!("non-printable character at index {}", i));
+    /// Checks that `data` contains only acceptable bytes.
+    pub(crate) fn check_no_low_bytes(value: &[u8]) -> Result<(), String> {
+        if let Some(i) = value.iter().position(|&b| b < 0x20) {
+            return Err(format!("invalid character at index {}", i));
         }
         Ok(())
     }
@@ -286,9 +299,7 @@ impl std::convert::TryFrom<Vec<u8>> for AsciiPacket {
 
     #[inline(never)]
     fn try_from(value: Vec<u8>) -> Result<Self, Self::Error> {
-        Self::check_printable(&value)?;
-        // SAFETY: printable ASCII => valid UTF-8.
-        let value = unsafe { String::from_utf8_unchecked(value) };
+        Self::check_no_low_bytes(&value)?;
         if value.len() < 2 || value.len() > 253 {
             return Err(format!(
                 "ASCII packet body length {} not in [2, 253].\nbody:\n{:?}",
@@ -328,7 +339,7 @@ impl std::convert::TryFrom<&[u8]> for AsciiPacket {
 }
 
 impl std::ops::Deref for AsciiPacket {
-    type Target = str;
+    type Target = [u8];
     fn deref(&self) -> &Self::Target {
         &self.0
     }

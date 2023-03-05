@@ -10,6 +10,7 @@ use arbitrary::Arbitrary;
 #[cfg(feature = "serde")]
 use serde::{de::Error as _, Deserialize, Serialize};
 
+use std::num::NonZeroU8;
 use std::str::FromStr;
 
 use crate::pkt::{AsciiPacket, Packet};
@@ -83,22 +84,22 @@ macro_rules! ascii_messages {
             #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
             pub struct $m $body
 
-            impl Into<Message> for $m {
+            impl From<$m> for Message {
                 #[inline]
-                fn into(self) -> Message {
-                    Message::$m(self)
+                fn from(value: $m) -> Message {
+                    Message::$m(value)
                 }
             }
-            impl Into<AsciiPacket> for &$m {
+            impl From<&$m> for AsciiPacket {
                 #[inline]
-                fn into(self) -> AsciiPacket {
-                    self.to_ascii()
+                fn from(value: &$m) -> AsciiPacket {
+                    value.to_ascii()
                 }
             }
-            impl Into<Packet> for &$m {
+            impl From<&$m> for Packet {
                 #[inline]
-                fn into(self) -> Packet {
-                    Packet::Ascii(self.to_ascii())
+                fn from(value: &$m) -> Packet {
+                    Packet::Ascii(value.to_ascii())
                 }
             }
         )*
@@ -119,6 +120,14 @@ ascii_messages! {
         pub code: ArmCode,
     }
 
+    /// `AM`: Alarm Memory Update.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
+    struct AlarmMemory {
+        /// `memory[i]` indicates if area `i` has alarm memory that must be cleared before arming.
+        pub memory: [bool; Area::MAX],
+    }
+
     /// `as`: Arming Status Request.
     #[derive(Clone, Debug, PartialEq, Eq)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
@@ -128,9 +137,9 @@ ascii_messages! {
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
     struct ArmingStatusReport {
-        pub arming_status: [ArmingStatus; NUM_AREAS],
-        pub up_state: [ArmUpState; NUM_AREAS],
-        pub alarm_state: [AlarmState; NUM_AREAS],
+        pub arming_status: [ArmingStatus; Area::MAX],
+        pub up_state: [ArmUpState; Area::MAX],
+        pub alarm_state: [AlarmState; Area::MAX],
         pub first_exit_time: u8,
     }
 
@@ -167,6 +176,13 @@ ascii_messages! {
         keypad: Keypad,
     }
 
+    /// `rp`: ElkRP Connection Status.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
+    struct RpStatusUpdate {
+        status: RpStatus,
+    }
+
     /// `rr`: request Real Time Clock Data.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
@@ -194,7 +210,42 @@ ascii_messages! {
     struct StringDescriptionResponse {
         pub ty: TextDescriptionType,
         pub num: u8,
+        pub show_on_keypad: bool,
         pub text: TextDescription,
+    }
+
+    /// `ss`: System Trouble Status Request.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
+    struct SystemTroubleStatusRequest {}
+
+    /// `SS`: System Trouble Status Response.
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
+    struct SystemTroubleStatusResponse {
+        pub ac_fail: bool,
+        pub box_tamper: Option<Zone>,
+        pub fail_to_communicate: bool,
+        pub eeprom_memory_error: bool,
+        pub control_low_battery: bool,
+        pub transmitter_low_battery: Option<Zone>,
+        pub over_current_trouble: bool,
+        pub telephone_fault_trouble: bool,
+        pub output_2_trouble: bool,
+        pub missing_keypad_trouble: bool,
+        pub zone_expander_trouble: bool,
+        pub output_expander: bool,
+        pub elkrp_remote_access: bool,
+        pub common_area_not_armed: bool,
+        pub flash_memory_error: bool,
+        pub security_alert: Option<Zone>,
+        pub serial_port_expander: bool,
+        pub lost_transmitter: Option<Zone>,
+        pub ge_smoke_cleanme: bool,
+        pub ethernet: bool,
+        pub display_message_keypad_line1: bool,
+        pub display_message_keypad_line2: bool,
+        pub fire: Option<Zone>,
     }
 
     /// `tn`: Task Activation.
@@ -234,7 +285,7 @@ ascii_messages! {
     /// `ZS`: Zone Status Report.
     #[derive(Copy, Clone, PartialEq, Eq)]
     struct ZoneStatusReport {
-        pub zones: [ZoneStatus; NUM_ZONES],
+        pub zones: [ZoneStatus; Zone::MAX],
     }
 }
 
@@ -248,7 +299,7 @@ impl Message {
     }
 
     pub fn parse_ascii(pkt: &AsciiPacket) -> Result<Option<Self>, Error> {
-        let payload = pkt.as_bytes();
+        let payload: &[u8] = pkt;
         if payload.len() < 4 {
             return Err(Error("malformed ASCII message: too short".into()));
         }
@@ -256,10 +307,12 @@ impl Message {
         match cmd {
             b"a0" | b"a1" | b"a2" | b"a3" | b"a4" | b"a5" | b"a6" | b"a7" | b"a8" | b"a9"
             | b"a:" => ArmRequest::from_ascii(cmd[1], data).map(Self::ArmRequest),
+            b"AM" => AlarmMemory::from_ascii_data(data).map(Self::AlarmMemory),
             b"as" => ArmingStatusRequest::from_ascii_data(data).map(Self::ArmingStatusRequest),
             b"AS" => ArmingStatusReport::from_ascii_data(data).map(Self::ArmingStatusReport),
             b"EE" => SendTimeData::from_ascii_data(data).map(Self::SendTimeData),
             b"IC" => SendCode::from_ascii_data(data).map(Self::SendCode),
+            b"RP" => RpStatusUpdate::from_ascii_data(data).map(Self::RpStatusUpdate),
             b"rr" => RtcRequest::from_ascii_data(data).map(Self::RtcRequest),
             b"RR" => RtcResponse::from_ascii_data(data).map(Self::RtcResponse),
             b"sd" => {
@@ -267,6 +320,10 @@ impl Message {
             }
             b"SD" => StringDescriptionResponse::from_ascii_data(data)
                 .map(Self::StringDescriptionResponse),
+            b"ss" => SystemTroubleStatusRequest::from_ascii_data(data)
+                .map(Self::SystemTroubleStatusRequest),
+            b"SS" => SystemTroubleStatusResponse::from_ascii_data(data)
+                .map(Self::SystemTroubleStatusResponse),
             b"tn" => ActivateTask::from_ascii_data(data).map(Self::ActivateTask),
             b"TC" => TaskChange::from_ascii_data(data).map(Self::TaskChange),
             b"XK" => Heartbeat::from_ascii_data(data).map(Self::Heartbeat),
@@ -280,9 +337,9 @@ impl Message {
     }
 }
 
-impl Into<Packet> for &Message {
-    fn into(self) -> Packet {
-        self.to_pkt()
+impl From<&Message> for Packet {
+    fn from(value: &Message) -> Packet {
+        value.to_pkt()
     }
 }
 
@@ -293,7 +350,7 @@ macro_rules! byte_enum {
         #[doc=$enum_doc:literal]
         $vis:vis enum $enum:ident {
             $(
-                $(#[doc=$var_doc:literal])?
+                $(#[doc=$var_doc:literal])*
                 $var:ident = $val:literal,
             )*
         }
@@ -432,7 +489,7 @@ impl TryFrom<&[u8]> for ArmCode {
         }
         let mut code = [0u8; 6];
         code.copy_from_slice(value);
-        if code.iter().any(|&b| b < b'0' || b > b'9') {
+        if code.iter().any(|b| !(b'0'..=b'9').contains(b)) {
             return Err("ArmCode must be numeric".to_owned());
         }
         Ok(ArmCode(code))
@@ -450,6 +507,20 @@ impl Arbitrary<'_> for ArmCode {
     fn size_hint(depth: usize) -> (usize, Option<usize>) {
         let _ = depth;
         (3, Some(3))
+    }
+}
+
+num_enum! {
+    /// The ElkRP connection status as seen in [`RpStatusUpdate`] messages.
+    pub enum RpStatus {
+        /// When Elk-RP disconnects, this status is broadcast to all other clients.
+        Disconnected = 0,
+
+        /// May be sent in response to polls while Elk-RP is connected.
+        Connected = 1,
+
+        /// May be sent in response to polls while Elk-M1XEP is powering up/rebooting.
+        Initializing = 2,
     }
 }
 
@@ -512,18 +583,23 @@ macro_rules! limited_u8 {
         #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
         #[doc=$doc]
         #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(transparent))]
-        pub struct $t(u8);
+        pub struct $t(NonZeroU8);
 
         impl $t {
+            pub const MAX: usize = $max;
+
             pub fn to_index(self) -> usize {
-                usize::from(self.0) - 1
+                usize::from(self.0.get()) - 1
             }
         }
 
         #[cfg(feature = "arbitrary")]
         impl Arbitrary<'_> for $t {
             fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-                Ok(Self(u.int_in_range(0..=$max)?))
+                Ok(Self(
+                    NonZeroU8::new(u.int_in_range(1..=$max)?)
+                        .expect("int_in_range should respect range"),
+                ))
             }
 
             fn size_hint(depth: usize) -> (usize, Option<usize>) {
@@ -547,7 +623,7 @@ macro_rules! limited_u8 {
             type Error = String;
 
             fn try_from(val: u8) -> Result<Self, Self::Error> {
-                if val < 1 || val > $max {
+                if !(1..=$max).contains(&val) {
                     return Err(format!(
                         "{} not in expected {} range of [1, {}]",
                         val,
@@ -555,13 +631,13 @@ macro_rules! limited_u8 {
                         $max,
                     ));
                 }
-                Ok(Self(val))
+                Ok(Self(NonZeroU8::new(val).expect("val should be non-zero")))
             }
         }
 
-        impl Into<u8> for $t {
-            fn into(self) -> u8 {
-                self.0
+        impl From<$t> for u8 {
+            fn from(value: $t) -> u8 {
+                value.0.get()
             }
         }
     };
@@ -588,21 +664,21 @@ impl DateTime {
             return Err("wrong length".to_owned());
         }
         let year = u16::from_str(&val[..4]).map_err(|_| "bad year".to_owned())?;
-        if year < 2000 || year > 2100 {
+        if !(2000..=2100).contains(&year) {
             return Err(format!("year {} out of range", year));
         }
         if &val[4..5] != "-" {
             return Err("bad year-month separator".to_owned());
         }
         let month = u8::from_str(&val[5..7]).map_err(|_| "bad month".to_owned())?;
-        if month < 1 || month > 12 {
+        if !(1..=12).contains(&month) {
             return Err(format!("month {} out of range", month));
         }
         if &val[7..8] != "-" {
             return Err("bad month-day separator".to_owned());
         }
         let day = u8::from_str(&val[8..10]).map_err(|_| "bad day".to_owned())?;
-        if day < 1 || day > 31 {
+        if !(1..=31).contains(&day) {
             return Err(format!("day {} out of range", day));
         }
         if &val[10..11] != "T" {
@@ -720,11 +796,11 @@ impl RtcData {
         let year = parse_u8_dec("year", &data[11..13])?;
         debug_assert!(year < 100);
         let month = parse_u8_dec("month", &data[9..11])?;
-        if month < 1 || month > 12 {
+        if !(1..=12).contains(&month) {
             return Err("month out of range".to_owned());
         }
         let day = parse_u8_dec("day", &data[7..9])?;
-        if day < 1 || day > 31 {
+        if !(1..=31).contains(&day) {
             return Err("day out of range".to_owned());
         }
         let hour = parse_u8_dec("hour", &data[4..6])?;
@@ -740,11 +816,7 @@ impl RtcData {
             return Err("second out of range".to_owned());
         }
         let weekday = Weekday::try_from(data[6])?;
-        let dst = match data[13] {
-            b'0' => false,
-            b'1' => true,
-            _ => return Err("bad dst flag".to_owned()),
-        };
+        let dst = parse_bool(data[13], "dst flag")?;
         let clock_display = ClockDisplayMode::try_from(data[14])?;
         let date_display = DateDisplayMode::try_from(data[15])?;
         Ok(Self {
@@ -763,7 +835,7 @@ impl RtcData {
         })
     }
 
-    fn to_ascii(&self) -> impl Iterator<Item = u8> {
+    fn to_ascii(self) -> impl Iterator<Item = u8> {
         format!(
             "{:02}{:02}{:02}{:01}{:02}{:02}{:02}{:01}{:01}{:01}",
             self.datetime.second,
@@ -773,7 +845,7 @@ impl RtcData {
             self.datetime.day,
             self.datetime.month,
             self.datetime.year,
-            if self.dst { 1 } else { 0 },
+            i32::from(self.dst),
             self.clock_display as u8 as char,
             self.date_display as u8 as char,
         )
@@ -781,11 +853,6 @@ impl RtcData {
         .into_iter()
     }
 }
-
-pub const NUM_AREAS: usize = 8;
-pub const NUM_KEYPADS: usize = 16;
-pub const NUM_TASKS: usize = 32;
-pub const NUM_ZONES: usize = 208;
 
 limited_u8! {
     /// A zone number in the range of `[1, 208]`.
@@ -813,7 +880,9 @@ impl SendTimeData {
             return Err(format!("expected at least 10 bytes, got {}", data.len()));
         }
         let area = match data[0] {
-            b @ b'1'..=b'8' => Area(b - b'0'),
+            b @ b'1'..=b'8' => {
+                Area(NonZeroU8::new(b - b'0').expect("1..=8 - 0 should be non-zero"))
+            }
             b => return Err(format!("expected area in [1, 8], got {:?}", b)),
         };
         let ty = TimeDataType::try_from(data[1])?;
@@ -948,7 +1017,7 @@ impl ZoneChange {
             status: ZoneStatus::from_ascii(data[3])?,
         })
     }
-    fn to_ascii(&self) -> AsciiPacket {
+    fn to_ascii(self) -> AsciiPacket {
         let msg = format!("ZC{:03}{:1X}00", self.zone, self.status.0);
         AsciiPacket::try_from(msg).expect("ZoneChange invalid")
     }
@@ -975,21 +1044,21 @@ impl ZoneStatusReport {
     };
 
     fn from_ascii_data(data: &[u8]) -> Result<Self, String> {
-        if data.len() < NUM_ZONES {
+        if data.len() < Zone::MAX {
             return Err(format!(
                 "expected at least {} bytes, got {}",
-                NUM_ZONES,
+                Zone::MAX,
                 data.len()
             ));
         }
-        let mut zones = [ZoneStatus(0); NUM_ZONES];
-        for i in 0..NUM_ZONES {
+        let mut zones = [ZoneStatus(0); Zone::MAX];
+        for i in 0..Zone::MAX {
             zones[i] = ZoneStatus::from_ascii(data[i])?;
         }
         Ok(ZoneStatusReport { zones })
     }
-    fn to_ascii(&self) -> AsciiPacket {
-        let mut msg = Vec::with_capacity(4 + NUM_ZONES);
+    fn to_ascii(self) -> AsciiPacket {
+        let mut msg = Vec::with_capacity(4 + Zone::MAX);
         msg.extend(b"ZS");
         for s in &self.zones {
             msg.push(s.to_ascii());
@@ -1051,7 +1120,7 @@ impl ArmRequest {
     }
 
     pub fn to_ascii(&self) -> AsciiPacket {
-        let msg: Vec<u8> = [b'a', self.level as u8, self.area.0 + b'0']
+        let msg: Vec<u8> = [b'a', self.level as u8, self.area.0.get() + b'0']
             .iter()
             .chain(self.code.0.iter())
             .chain(b"00".iter())
@@ -1128,6 +1197,30 @@ byte_enum! {
     }
 }
 
+impl AlarmMemory {
+    fn from_ascii_data(data: &[u8]) -> Result<Self, String> {
+        if data.len() != Area::MAX {
+            return Err(format!("expected {} bytes", Area::MAX));
+        }
+        let mut memory = [false; Area::MAX];
+        for i in 0..Area::MAX {
+            memory[i] = parse_bool(data[i], "memory status")?;
+        }
+        Ok(AlarmMemory { memory })
+    }
+    pub fn to_ascii(&self) -> AsciiPacket {
+        let msg: Vec<_> = b"AM"
+            .iter()
+            .copied()
+            .chain(self.memory.iter().copied().map(fmt_bool))
+            .collect();
+        AsciiPacket::try_from(msg).expect("AlarmMemory valid ascii")
+    }
+    pub fn is_response_to(&self, _request: &Message) -> bool {
+        false
+    }
+}
+
 impl AlarmState {
     #[inline]
     pub fn is_firing(self) -> bool {
@@ -1147,13 +1240,13 @@ impl ArmingStatusReport {
         if data.len() < 26 {
             return Err(format!("expected at least {} data", 26));
         }
-        let mut arming_status = [ArmingStatus::Disarmed; NUM_AREAS];
-        let mut up_state = [ArmUpState::ReadyToArm; NUM_AREAS];
-        let mut alarm_state = [AlarmState::NoAlarmActive; NUM_AREAS];
-        for i in 0..8 {
+        let mut arming_status = [ArmingStatus::Disarmed; Area::MAX];
+        let mut up_state = [ArmUpState::ReadyToArm; Area::MAX];
+        let mut alarm_state = [AlarmState::NoAlarmActive; Area::MAX];
+        for i in 0..Area::MAX {
             arming_status[i] = ArmingStatus::try_from(data[i])?;
-            up_state[i] = ArmUpState::try_from(data[NUM_AREAS + i])?;
-            alarm_state[i] = AlarmState::try_from(data[2 * NUM_AREAS + i])?;
+            up_state[i] = ArmUpState::try_from(data[Area::MAX + i])?;
+            alarm_state[i] = AlarmState::try_from(data[2 * Area::MAX + i])?;
         }
         let first_exit_time =
             AsciiPacket::dehex_byte(data[24], data[25]).map_err(|()| "bad first_exit_time")?;
@@ -1197,6 +1290,29 @@ impl ArmingStatusReport {
             }
         }
         false
+    }
+}
+
+impl RpStatusUpdate {
+    fn from_ascii_data(data: &[u8]) -> Result<Self, String> {
+        if data.len() < 4 {
+            return Err(format!("expected at least 4 bytes, got {}", data.len()));
+        }
+        let b = AsciiPacket::dehex_byte(data[0], data[1]).map_err(|()| "invalid hex code")?;
+        let status = RpStatus::try_from(b)?;
+        Ok(RpStatusUpdate { status })
+    }
+    fn is_response_to(&self, _request: &Message) -> bool {
+        matches!(self.status, RpStatus::Connected | RpStatus::Initializing)
+    }
+    fn to_ascii(self) -> AsciiPacket {
+        let msg: Vec<u8> = [b'R', b'P']
+            .iter()
+            .copied()
+            .chain(AsciiPacket::hex_byte(self.status as u8))
+            .chain([b'0', b'0'])
+            .collect();
+        AsciiPacket::try_from(msg).expect("RpStatusUpdate valid")
     }
 }
 
@@ -1261,7 +1377,7 @@ impl RtcRequest {
     fn from_ascii_data(_data: &[u8]) -> Result<Self, String> {
         Ok(RtcRequest {})
     }
-    fn to_ascii(&self) -> AsciiPacket {
+    fn to_ascii(self) -> AsciiPacket {
         AsciiPacket::try_from("rr00").expect("RtcResponse valid")
     }
     fn is_response_to(&self, _request: &Message) -> bool {
@@ -1275,7 +1391,7 @@ impl RtcResponse {
             rtc_data: RtcData::from_ascii(data)?,
         })
     }
-    fn to_ascii(&self) -> AsciiPacket {
+    fn to_ascii(self) -> AsciiPacket {
         let msg: Vec<u8> = [b'R', b'R']
             .iter()
             .copied()
@@ -1316,7 +1432,7 @@ impl TextDescription {
 
     /// Uses up to 16 bytes of `text`, which must be ASCII printable characters.
     pub fn new(text: &str) -> Result<Self, String> {
-        AsciiPacket::check_printable(text.as_bytes())?;
+        AsciiPacket::check_no_low_bytes(text.as_bytes())?;
         let mut this = Self::default();
         for (b_in, b_out) in text.as_bytes().iter().zip(this.0.iter_mut()) {
             *b_out = *b_in;
@@ -1324,12 +1440,13 @@ impl TextDescription {
         Ok(this)
     }
 
-    fn as_padded_str(&self) -> &str {
-        std::str::from_utf8(&self.0[..]).unwrap()
-    }
-
     pub fn as_str(&self) -> &str {
-        self.as_padded_str().trim_end_matches(' ')
+        let end = self
+            .0
+            .iter()
+            .position(|&b| b == b' ')
+            .unwrap_or(self.0.len());
+        std::str::from_utf8(&self.0[..end]).expect("TextDescription should be valid UTF-8")
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1374,14 +1491,18 @@ impl<const N: usize> std::fmt::Debug for TextDescriptions<N> {
 #[cfg(feature = "arbitrary")]
 impl Arbitrary<'_> for TextDescription {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-        let mut buf = [0u8; 16];
-        u.fill_buffer(&mut buf)?;
-        AsciiPacket::check_printable(&buf).map_err(|_| arbitrary::Error::IncorrectFormat)?;
+        let mut buf = [b' '; 16];
+        let mut i = 0;
+        u.arbitrary_loop(Some(0), Some(16), |u| {
+            buf[i] = u.int_in_range(0x21..=0x7F)?;
+            i += 1;
+            Ok(std::ops::ControlFlow::Continue(()))
+        })?;
         Ok(TextDescription(buf))
     }
 
     fn size_hint(_depth: usize) -> (usize, Option<usize>) {
-        (16, Some(16))
+        (0, Some(16))
     }
 }
 
@@ -1419,17 +1540,30 @@ impl StringDescriptionResponse {
         }
         let ty = TextDescriptionType::try_from(parse_u8_dec("type", &data[0..2])?)?;
         let num = parse_u8_dec("num", &data[2..5])?;
-        let text = TextDescription(data[5..21].try_into().expect("slice->array"));
-        Ok(StringDescriptionResponse { ty, num, text })
+        let mut text: [u8; 16] = data[5..21]
+            .try_into()
+            .expect("fixed slice and array lengths should match");
+        let show_on_keypad = (text[0] & 0b1000_0000) != 0;
+        text[0] &= 0b0111_1111;
+        let text = TextDescription(text);
+        Ok(StringDescriptionResponse {
+            ty,
+            num,
+            show_on_keypad,
+            text,
+        })
     }
     fn to_ascii(&self) -> AsciiPacket {
-        let msg = format!(
-            "SD{:02}{:03}{}00",
-            self.ty as u8,
-            self.num,
-            self.text.as_padded_str()
-        );
-        AsciiPacket::try_from(msg).expect("StringDescriptionResponse valid")
+        let mut out = Vec::with_capacity(7 + 16 + 2);
+        use std::io::Write;
+        write!(&mut out, "SD{:02}{:03}", self.ty as u8, self.num)
+            .expect("write to Vec should succeed");
+        out.extend(&self.text.0[..]);
+        out.extend(b"00");
+        if self.show_on_keypad {
+            out[7] |= 0x80;
+        }
+        AsciiPacket::try_from(out).expect("StringDescriptionResponse valid")
     }
     fn is_response_to(&self, request: &Message) -> bool {
         matches!(
@@ -1446,6 +1580,141 @@ impl StringDescriptionResponse {
             if self.ty == *ty && (self.num >= *num || self.num == 0)
         )
     }
+}
+
+impl SystemTroubleStatusRequest {
+    fn from_ascii_data(_data: &[u8]) -> Result<Self, String> {
+        Ok(SystemTroubleStatusRequest {})
+    }
+    fn to_ascii(&self) -> AsciiPacket {
+        AsciiPacket::try_from("ss00").expect("SystemTroubleStatusRequest should be valid")
+    }
+    fn is_response_to(&self, _request: &Message) -> bool {
+        false
+    }
+}
+
+impl SystemTroubleStatusResponse {
+    fn from_ascii_data(data: &[u8]) -> Result<Self, String> {
+        if data.len() < 34 {
+            return Err(format!(
+                "SS should be at least 34 bytes, got {}",
+                data.len()
+            ));
+        }
+        let ac_fail = parse_bool(data[0], "ac_fail")?;
+        let box_tamper = parse_zone_trouble(data[1], "box_tamper")?;
+        let fail_to_communicate = parse_bool(data[2], "fail_to_communicate")?;
+        let eeprom_memory_error = parse_bool(data[3], "eeprom_memory_error")?;
+        let control_low_battery = parse_bool(data[4], "control_low_battery")?;
+        let transmitter_low_battery = parse_zone_trouble(data[5], "transmitter_low_battery")?;
+        let over_current_trouble = parse_bool(data[6], "over_current_trouble")?;
+        let telephone_fault_trouble = parse_bool(data[7], "telephone_fault_trouble")?;
+        // data[8] is unused
+        let output_2_trouble = parse_bool(data[9], "output_2_trouble")?;
+        let missing_keypad_trouble = parse_bool(data[10], "missing_keypad_trouble")?;
+        let zone_expander_trouble = parse_bool(data[11], "zone_expander_trouble")?;
+        let output_expander = parse_bool(data[12], "output_expander")?;
+        // data[13] is not used
+        let elkrp_remote_access = parse_bool(data[14], "elkrp_remote_access")?;
+        // data[15] is not used
+        let common_area_not_armed = parse_bool(data[16], "common_area_not_armed")?;
+        let flash_memory_error = parse_bool(data[17], "flash_memory_error")?;
+        let security_alert = parse_zone_trouble(data[18], "security_alert")?;
+        let serial_port_expander = parse_bool(data[19], "serial_port_expander")?;
+        let lost_transmitter = parse_zone_trouble(data[20], "lost_transmitter")?;
+        let ge_smoke_cleanme = parse_bool(data[21], "ge_smoke_cleanme")?;
+        let ethernet = parse_bool(data[22], "ethernet")?;
+        // data[23..=30] are not used.
+        let display_message_keypad_line1 = parse_bool(data[31], "display_message_keypad_line1")?;
+        let display_message_keypad_line2 = parse_bool(data[32], "display_message_keypad_line2")?;
+        let fire = parse_zone_trouble(data[33], "fire")?; // TODO: different?
+        Ok(SystemTroubleStatusResponse {
+            ac_fail,
+            box_tamper,
+            fail_to_communicate,
+            eeprom_memory_error,
+            control_low_battery,
+            transmitter_low_battery,
+            over_current_trouble,
+            telephone_fault_trouble,
+            output_2_trouble,
+            missing_keypad_trouble,
+            zone_expander_trouble,
+            output_expander,
+            elkrp_remote_access,
+            common_area_not_armed,
+            flash_memory_error,
+            security_alert,
+            serial_port_expander,
+            lost_transmitter,
+            ge_smoke_cleanme,
+            ethernet,
+            display_message_keypad_line1,
+            display_message_keypad_line2,
+            fire,
+        })
+    }
+    fn to_ascii(&self) -> AsciiPacket {
+        AsciiPacket::try_from(
+            &[
+                b'S',
+                b'S',
+                fmt_bool(self.ac_fail),
+                fmt_zone_trouble(self.box_tamper),
+                fmt_bool(self.fail_to_communicate),
+                fmt_bool(self.eeprom_memory_error),
+                fmt_bool(self.control_low_battery),
+                fmt_zone_trouble(self.transmitter_low_battery),
+                fmt_bool(self.over_current_trouble),
+                fmt_bool(self.telephone_fault_trouble),
+                b'0',
+                fmt_bool(self.output_2_trouble),
+                fmt_bool(self.missing_keypad_trouble),
+                fmt_bool(self.zone_expander_trouble),
+                fmt_bool(self.output_expander),
+                b'0',
+                fmt_bool(self.elkrp_remote_access),
+                b'0',
+                fmt_bool(self.common_area_not_armed),
+                fmt_bool(self.flash_memory_error),
+                fmt_zone_trouble(self.security_alert),
+                fmt_bool(self.serial_port_expander),
+                fmt_zone_trouble(self.lost_transmitter),
+                fmt_bool(self.ge_smoke_cleanme),
+                fmt_bool(self.ethernet),
+                b'0',
+                b'0',
+                b'0',
+                b'0',
+                b'0',
+                b'0',
+                b'0',
+                b'0',
+                fmt_bool(self.display_message_keypad_line1),
+                fmt_bool(self.display_message_keypad_line2),
+                fmt_zone_trouble(self.fire),
+                b'0',
+                b'0',
+            ][..],
+        )
+        .expect("SystemTroubleStatusRequest should be valid")
+    }
+    fn is_response_to(&self, request: &Message) -> bool {
+        matches!(request, Message::SystemTroubleStatusRequest(_))
+    }
+}
+
+fn parse_zone_trouble(data: u8, which: &str) -> Result<Option<Zone>, String> {
+    Ok(NonZeroU8::new(
+        data.checked_sub(b'0')
+            .ok_or_else(|| format!("invalid {which} zone trouble byte"))?,
+    )
+    .map(Zone))
+}
+
+fn fmt_zone_trouble(zone: Option<Zone>) -> u8 {
+    zone.map(u8::from).unwrap_or(0) + b'0'
 }
 
 impl ActivateTask {
@@ -1488,7 +1757,7 @@ impl Heartbeat {
             rtc_data: RtcData::from_ascii(data)?,
         })
     }
-    fn to_ascii(&self) -> AsciiPacket {
+    fn to_ascii(self) -> AsciiPacket {
         let msg: Vec<u8> = [b'X', b'K']
             .iter()
             .copied()
@@ -1501,21 +1770,46 @@ impl Heartbeat {
     }
 }
 
+fn parse_bool(b: u8, name: &str) -> Result<bool, String> {
+    match b {
+        b'0' => Ok(false),
+        b'1' => Ok(true),
+        _ => Err(format!("unexpected value {b:x?} for {name}")),
+    }
+}
+
+fn fmt_bool(b: bool) -> u8 {
+    match b {
+        false => b'0',
+        true => b'1',
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /*#[test]
-    fn valid_as_report_without_timer() {
+    use pretty_assertions::assert_eq;
 
-    }*/
+    #[test]
+    fn valid_am_update() {
+        let pkt = Packet::Ascii(AsciiPacket::try_from("AM00000001").unwrap());
+        let msg = Message::parse(&pkt).unwrap().unwrap();
+        assert_eq!(
+            msg,
+            Message::AlarmMemory(AlarmMemory {
+                memory: [false, false, false, false, false, false, false, true]
+            })
+        );
+        assert_eq!(msg.to_pkt(), pkt);
+    }
 
     #[test]
     fn valid_as_report_with_timer() {
         let mut expected = ArmingStatusReport {
-            arming_status: [ArmingStatus::Disarmed; NUM_AREAS],
-            up_state: [ArmUpState::ReadyToArm; NUM_AREAS],
-            alarm_state: [AlarmState::NoAlarmActive; NUM_AREAS],
+            arming_status: [ArmingStatus::Disarmed; Area::MAX],
+            up_state: [ArmUpState::ReadyToArm; Area::MAX],
+            alarm_state: [AlarmState::NoAlarmActive; Area::MAX],
             first_exit_time: 59,
         };
         expected.arming_status[0] = ArmingStatus::ArmedStay;
@@ -1576,6 +1870,19 @@ mod tests {
     }
 
     #[test]
+    fn valid_rp_update() {
+        let pkt = Packet::Ascii(AsciiPacket::try_from("RP0100").unwrap());
+        let msg = Message::parse(&pkt).unwrap().unwrap();
+        assert_eq!(
+            msg,
+            Message::RpStatusUpdate(RpStatusUpdate {
+                status: RpStatus::Connected,
+            })
+        );
+        assert_eq!(msg.to_pkt(), pkt);
+    }
+
+    #[test]
     fn valid_sd_req() {
         let pkt = Packet::Ascii(AsciiPacket::try_from("sd0100100").unwrap());
         let msg = Message::parse(&pkt).unwrap().unwrap();
@@ -1598,7 +1905,42 @@ mod tests {
             Message::StringDescriptionResponse(StringDescriptionResponse {
                 ty: TextDescriptionType::Task,
                 num: 1,
+                show_on_keypad: false,
                 text: TextDescription::new("Garage Door").unwrap(),
+            })
+        );
+        assert_eq!(msg.to_pkt(), pkt);
+    }
+
+    #[test]
+    fn valid_sd_report_with_high_bit() {
+        let pkt =
+            Packet::Ascii(AsciiPacket::try_from(&b"SD05001\xc7arage Door     00"[..]).unwrap());
+        let msg = Message::parse(&pkt).unwrap().unwrap();
+        assert_eq!(
+            msg,
+            Message::StringDescriptionResponse(StringDescriptionResponse {
+                ty: TextDescriptionType::Task,
+                num: 1,
+                show_on_keypad: true,
+                text: TextDescription::new("Garage Door").unwrap(),
+            })
+        );
+        assert_eq!(msg.to_pkt(), pkt);
+    }
+
+    #[test]
+    fn valid_ss_report() {
+        let pkt =
+            Packet::Ascii(AsciiPacket::try_from("SS000000000100000000000000000000010A00").unwrap());
+        let msg = Message::parse(&pkt).unwrap().unwrap();
+        assert_eq!(
+            msg,
+            Message::SystemTroubleStatusResponse(SystemTroubleStatusResponse {
+                output_2_trouble: true,
+                display_message_keypad_line1: true,
+                fire: Some(Zone::try_from(17).expect("17 should be a valid zone")),
+                ..Default::default()
             })
         );
         assert_eq!(msg.to_pkt(), pkt);
@@ -1621,9 +1963,9 @@ mod tests {
     #[test]
     fn suspicious() {
         let disarmed = ArmingStatusReport {
-            arming_status: [ArmingStatus::Disarmed; NUM_AREAS],
-            up_state: [ArmUpState::ReadyToArm; NUM_AREAS],
-            alarm_state: [AlarmState::NoAlarmActive; NUM_AREAS],
+            arming_status: [ArmingStatus::Disarmed; Area::MAX],
+            up_state: [ArmUpState::ReadyToArm; Area::MAX],
+            alarm_state: [AlarmState::NoAlarmActive; Area::MAX],
             first_exit_time: 0,
         };
         let mut arming = disarmed;

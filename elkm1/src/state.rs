@@ -114,13 +114,13 @@ impl Panel {
         };
         this.init_req(msg::ArmingStatusRequest {}.into()).await?;
         this.init_req(msg::ZoneStatusRequest {}.into()).await?;
-        this.send_sds(msg::TextDescriptionType::Area, msg::NUM_AREAS)
+        this.send_sds(msg::TextDescriptionType::Area, msg::Area::MAX)
             .await?;
-        this.send_sds(msg::TextDescriptionType::Task, msg::NUM_TASKS)
+        this.send_sds(msg::TextDescriptionType::Task, msg::Task::MAX)
             .await?;
-        this.send_sds(msg::TextDescriptionType::Zone, msg::NUM_ZONES)
+        this.send_sds(msg::TextDescriptionType::Zone, msg::Zone::MAX)
             .await?;
-        /*for i in 0..NUM_ZONES {
+        /*for i in 0..Zone::MAX {
             if this.zone_status.as_deref().unwrap()[i].physical() != msg::ZonePhysicalStatus::Unconfigured {
                 this.init_req()
             }
@@ -138,7 +138,7 @@ impl Panel {
         &self.state.zone_names.0[zone.to_index()]
     }
 
-    pub fn area_names(&self) -> &msg::TextDescriptions<{ msg::NUM_AREAS }> {
+    pub fn area_names(&self) -> &msg::TextDescriptions<{ msg::Area::MAX }> {
         &self.state.area_names
     }
 
@@ -164,12 +164,20 @@ impl Panel {
         self.conn.send(send.to_pkt()).await?;
         while let Some(received) = self.conn.next().await {
             let received = self.interpret(received?);
-            if let Some(Ok(r)) = &received.msg {
-                if r.is_response_to(&send) {
-                    tracing::debug!(msg = ?received, "received reply");
+            if let Some(Ok(msg)) = &received.msg {
+                if let Message::RpStatusUpdate(msg) = msg {
+                    // TODO: maybe wait a bit and retry in the Initializing case.
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("received RP status update during initialization: {msg:#?}"),
+                    ));
+                } else if msg.is_response_to(&send) {
+                    tracing::debug!(?msg, "received reply");
                     return Ok(received);
                 }
-                tracing::debug!(msg = ?received, "received unrelated message while awaiting reply");
+                tracing::debug!(?msg, "received unrelated message while awaiting reply");
+            } else {
+                tracing::debug!(pkt = ?received, "received uninterpreted packet while awaiting reply");
             }
         }
         Err(std::io::Error::new(
@@ -237,7 +245,12 @@ impl Panel {
                 }
                 _ => {}
             }
-            if let CmdState::Busy { request: Some(request), waker, .. } = &mut self.cmd_state {
+            if let CmdState::Busy {
+                request: Some(request),
+                waker,
+                ..
+            } = &mut self.cmd_state
+            {
                 if m.is_response_to(request) {
                     if let Some(w) = waker.take() {
                         w.wake();
@@ -396,7 +409,11 @@ impl Sink<Command> for Panel {
     ) -> Poll<Result<(), Self::Error>> {
         let this = Pin::into_inner(self);
         match &mut this.cmd_state {
-            CmdState::Busy { flushed, ref request, .. } if !*flushed => {
+            CmdState::Busy {
+                flushed,
+                ref request,
+                ..
+            } if !*flushed => {
                 match this.conn.poll_flush_unpin(cx) {
                     Poll::Ready(Ok(())) => {}
                     o => return o,
@@ -427,9 +444,9 @@ impl Sink<Command> for Panel {
 struct PanelState {
     arming_status: Option<msg::ArmingStatusReport>,
     zone_statuses: Option<msg::ZoneStatusReport>,
-    zone_names: msg::TextDescriptions<{ msg::NUM_ZONES }>,
-    area_names: msg::TextDescriptions<{ msg::NUM_AREAS }>,
-    task_names: msg::TextDescriptions<{ msg::NUM_TASKS }>,
+    zone_names: msg::TextDescriptions<{ msg::Zone::MAX }>,
+    area_names: msg::TextDescriptions<{ msg::Area::MAX }>,
+    task_names: msg::TextDescriptions<{ msg::Task::MAX }>,
 }
 
 impl PanelState {
@@ -515,7 +532,7 @@ pub enum Command {
 
     /// Sends on a packet, without interpretation or flagging it as needing a
     /// response.
-    /// 
+    ///
     /// TODO: this is an experiment; we may end up trying to interpret these to
     /// identify the responses for flow control.
     Raw(pkt::Packet),
@@ -536,6 +553,7 @@ impl Command {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum CmdState {
     Idle,
     Busy {
@@ -596,7 +614,16 @@ mod tests {
                     } else {
                         (i as u8 + 1, names[i])
                     };
-                    send(conn, &msg::StringDescriptionResponse { ty, num, text }).await;
+                    send(
+                        conn,
+                        &msg::StringDescriptionResponse {
+                            ty,
+                            num,
+                            show_on_keypad: false,
+                            text,
+                        },
+                    )
+                    .await;
                 }
                 _ => unreachable!(),
             }
@@ -609,9 +636,9 @@ mod tests {
 
         let mut state = PanelState {
             arming_status: Some(msg::ArmingStatusReport {
-                arming_status: [msg::ArmingStatus::Disarmed; { msg::NUM_AREAS }],
-                up_state: [msg::ArmUpState::NotReadyToArm; { msg::NUM_AREAS }],
-                alarm_state: [msg::AlarmState::NoAlarmActive; { msg::NUM_AREAS }],
+                arming_status: [msg::ArmingStatus::Disarmed; { msg::Area::MAX }],
+                up_state: [msg::ArmUpState::NotReadyToArm; { msg::Area::MAX }],
+                alarm_state: [msg::AlarmState::NoAlarmActive; { msg::Area::MAX }],
                 first_exit_time: 0,
             }),
             zone_statuses: Some(msg::ZoneStatusReport::ALL_UNCONFIGURED),
@@ -644,7 +671,7 @@ mod tests {
             tokio::join!(send_ascii(server, a.msg), async {
                 let event = panel.next().await.unwrap().unwrap();
                 match &event.pkt {
-                    Some(pkt::Packet::Ascii(p)) => assert_eq!(&p[..], a.msg),
+                    Some(pkt::Packet::Ascii(p)) => assert_eq!(&p[..], a.msg.as_bytes()),
                     _ => unreachable!(),
                 }
                 (a.checker)(&event, &panel);
@@ -657,9 +684,9 @@ mod tests {
         let (client, mut server) = socketpair().await;
         const INITIAL: PanelState = PanelState {
             arming_status: Some(msg::ArmingStatusReport {
-                arming_status: [msg::ArmingStatus::Disarmed; { msg::NUM_AREAS }],
-                up_state: [msg::ArmUpState::ReadyToArm; { msg::NUM_AREAS }],
-                alarm_state: [msg::AlarmState::NoAlarmActive; { msg::NUM_AREAS }],
+                arming_status: [msg::ArmingStatus::Disarmed; { msg::Area::MAX }],
+                up_state: [msg::ArmUpState::ReadyToArm; { msg::Area::MAX }],
+                alarm_state: [msg::AlarmState::NoAlarmActive; { msg::Area::MAX }],
                 first_exit_time: 0,
             }),
             zone_statuses: Some(msg::ZoneStatusReport::ALL_UNCONFIGURED),
@@ -751,9 +778,9 @@ mod tests {
         let (client, mut server) = socketpair().await;
         const INITIAL: PanelState = PanelState {
             arming_status: Some(msg::ArmingStatusReport {
-                arming_status: [msg::ArmingStatus::Disarmed; { msg::NUM_AREAS }],
-                up_state: [msg::ArmUpState::ReadyToArm; { msg::NUM_AREAS }],
-                alarm_state: [msg::AlarmState::NoAlarmActive; { msg::NUM_AREAS }],
+                arming_status: [msg::ArmingStatus::Disarmed; { msg::Area::MAX }],
+                up_state: [msg::ArmUpState::ReadyToArm; { msg::Area::MAX }],
+                alarm_state: [msg::AlarmState::NoAlarmActive; { msg::Area::MAX }],
                 first_exit_time: 0,
             }),
             zone_statuses: Some(msg::ZoneStatusReport::ALL_UNCONFIGURED),

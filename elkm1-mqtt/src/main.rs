@@ -476,7 +476,7 @@ async fn main() {
                 // drop it when the queue fills.
                 let panel_event = Arc::new(panel_event);
                 let mut l = client_senders.lock().expect("client_senders shouldn't be poisoned");
-                l.retain_mut(|tx| !tx.try_send(Arc::clone(&panel_event)).is_err());
+                l.retain_mut(|tx| tx.try_send(Arc::clone(&panel_event)).is_ok());
             },
             publish = rx.recv() => {
                 let publish = publish.unwrap();

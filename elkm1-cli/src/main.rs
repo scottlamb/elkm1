@@ -35,7 +35,7 @@ async fn watch(addr: String) {
             Some(state::Change::ArmingStatus { prior }) => {
                 let cur = panel.arming_status();
                 let area_names = panel.area_names();
-                for i in 0..msg::NUM_AREAS {
+                for i in 0..msg::Area::MAX {
                     if prior.arming_status[i] != cur.arming_status[i]
                         || prior.up_state[i] != cur.up_state[i]
                         || prior.alarm_state[i] != cur.alarm_state[i]
