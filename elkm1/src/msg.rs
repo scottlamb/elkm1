@@ -33,9 +33,9 @@ fn parse_u8_dec(name: &str, val: &[u8]) -> Result<u8, String> {
         .map_err(|_| format!("{} expected to be decimal in [0, 255); got {:?}", name, val))
 }
 
-/// Defines all messages, taking care of some `enum Message` and `Into`
+/// Defines all ASCII messages, taking care of some `enum Message` and `Into`
 /// boilerplate.
-macro_rules! messages {
+macro_rules! ascii_messages {
     (
         $(
             #[doc=$doc:literal]
@@ -105,7 +105,7 @@ macro_rules! messages {
     }
 }
 
-messages! {
+ascii_messages! {
     /// `aL`: Arm/Disarm Request.
     ///
     /// For arming to succeed, the supplied `code` must belong to a user which does *not* have the

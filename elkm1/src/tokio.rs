@@ -29,6 +29,16 @@ impl Connection {
         let stream = TcpStream::connect(addr).await?;
         Ok(Connection(Framed::new(stream, Codec)))
     }
+
+    pub fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.0.get_ref().peer_addr()
+    }
+}
+
+impl From<TcpStream> for Connection {
+    fn from(value: TcpStream) -> Self {
+        Self(Framed::new(value, Codec))
+    }
 }
 
 impl Stream for Connection {

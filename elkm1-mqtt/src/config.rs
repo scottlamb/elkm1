@@ -12,6 +12,15 @@ use serde::Deserialize;
 pub struct ConfigFile {
     pub elk: Elk,
     pub mqtt: Mqtt,
+
+    #[serde(default)]
+    pub binds: Vec<Bind>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Bind {
+    pub ipv4: std::net::SocketAddrV4, // TODO: also support ipv6 + unix + systemd socket activation.
 }
 
 fn mqtt_default_port() -> u16 {

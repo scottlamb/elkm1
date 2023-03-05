@@ -33,11 +33,17 @@
 //!     *   [Buttons](https://www.home-assistant.io/integrations/button.mqtt/) for
 //!         automation tasks.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
-use elkm1::state;
+use elkm1::state::{self, Command, Event};
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
+use tokio::net::{TcpListener, TcpStream};
+use tracing::Instrument;
 
 mod config;
 
@@ -210,6 +216,7 @@ async fn handle_publish(
     code: elkm1::msg::ArmCode,
     panel: &mut elkm1::state::Panel,
     publish: rumqttc::Publish,
+    panel_span: &tracing::Span,
 ) {
     tracing::info!(?publish, payload = ?publish.payload, "received mqtt publish");
 
@@ -244,6 +251,7 @@ async fn handle_publish(
                 level,
                 code,
             }))
+            .instrument(panel_span.clone())
             .await
             .unwrap();
 
@@ -282,6 +290,71 @@ fn setup_tracing() {
     );
     tracing::subscriber::set_global_default(sub).unwrap();
 }
+
+async fn handle_listener(
+    listener: TcpListener,
+    to_panel: tokio::sync::mpsc::Sender<Command>,
+    client_senders: ClientSenders,
+) {
+    loop {
+        let (client, cli_addr) = listener.accept().await.expect("accept should succeed");
+        let (from_panel_tx, from_panel_rx) = tokio::sync::mpsc::channel(1024);
+        client_senders
+            .lock()
+            .expect("client_senders shouldn't be poisoned")
+            .push(from_panel_tx);
+        let to_panel = to_panel.clone();
+        let span = tracing::info_span!(
+            "client",
+            net.sock.peer.addr = %cli_addr.ip(),
+            net.sock.peer.port = %cli_addr.port(),
+        );
+        tokio::task::spawn(handle_client(client, from_panel_rx, to_panel).instrument(span));
+    }
+}
+
+async fn handle_client(
+    client: TcpStream,
+    mut from_panel: tokio::sync::mpsc::Receiver<Arc<Event>>,
+    to_panel: tokio::sync::mpsc::Sender<Command>,
+) {
+    tracing::info!("accepted connection");
+    let mut conn = elkm1::tokio::Connection::from(client);
+    loop {
+        tokio::select! {
+            event = from_panel.recv() => {
+                let Some(event) = event else {
+                    tracing::error!("closing connection after falling too far behind");
+                    return;
+                };
+                if let Some(ref pkt) = event.pkt {
+                    if let Err(err) = conn.send(pkt.clone()).await {
+                        tracing::error!(%err, "closing connection due to send error");
+                        return;
+                    }
+                }
+            }
+            pkt = conn.next() => {
+                match pkt {
+                    Some(Ok(pkt)) => {
+                        tracing::info!(?pkt, "client->panel packet");
+                        if let Err(err) = to_panel.send(Command::Raw(pkt.clone())).await {
+                            tracing::error!(?pkt, %err, "closing connection after failure enqueueing pkt to panel");
+                            return;
+                        }
+                    },
+                    Some(Err(err)) => {
+                        tracing::error!(%err, "closing connection due to read error");
+                        return;
+                    }
+                    None => return,
+                }
+            }
+        }
+    }
+}
+
+type ClientSenders = Arc<Mutex<Vec<tokio::sync::mpsc::Sender<Arc<Event>>>>>;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -322,8 +395,20 @@ async fn main() {
     let (mqtt_cli, mqtt_eventloop) = rumqttc::AsyncClient::new(mqtt_opts, 10);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(run_eventloop(mqtt_eventloop, tx));
-    let panel = state::Panel::connect(&cfg.elk.host_port).await.unwrap();
-    tracing::info!("panel initialized");
+
+    let panel = elkm1::tokio::Connection::connect(&cfg.elk.host_port)
+        .await
+        .unwrap();
+    let panel_addr = panel.peer_addr().unwrap();
+    let panel_span = tracing::info_span!(
+        "panel",
+        net.sock.peer.addr = %panel_addr.ip(),
+        net.sock.peer.port = %panel_addr.port(),
+    );
+    let panel = state::Panel::new(panel)
+        .instrument(panel_span.clone())
+        .await
+        .unwrap();
     let code = elkm1::msg::ArmCode::try_from(cfg.elk.code).unwrap();
     if let Some(ha_discovery_prefix) = cfg.mqtt.ha_discovery_prefix {
         publish_ha_discovery(&mqtt_cli, &topic_prefix, &ha_discovery_prefix, &cfg.elk).await;
@@ -348,11 +433,25 @@ async fn main() {
         .await
         .unwrap();
     tokio::pin!(panel);
+
+    let client_senders = Arc::new(Mutex::new(Vec::new()));
+    let (to_panel_tx, mut to_panel_rx) = tokio::sync::mpsc::channel(1024);
+
+    for bind in cfg.binds {
+        let listener = tokio::net::TcpListener::bind(bind.ipv4)
+            .await
+            .expect("bind should succeed");
+        tokio::spawn(handle_listener(
+            listener,
+            to_panel_tx.clone(),
+            client_senders.clone(),
+        ));
+    }
     loop {
         tokio::select! {
-            panel_event = panel.next() => {
+            panel_event = panel.next().instrument(panel_span.clone()) => {
                 let panel_event = panel_event.unwrap().unwrap();
-                tracing::info!(?panel_event, "panel event");
+                tracing::info!(parent: &panel_span, ?panel_event, "panel event");
                 mqtt_cli.publish(
                     format!("{}/event", &topic_prefix),
                     rumqttc::QoS::AtLeastOnce,
@@ -372,10 +471,20 @@ async fn main() {
                     }
                     _ => {}
                 }
+
+                // Send the message on to clients. If one is stuck, don't let it hold up the show;
+                // drop it when the queue fills.
+                let panel_event = Arc::new(panel_event);
+                let mut l = client_senders.lock().expect("client_senders shouldn't be poisoned");
+                l.retain_mut(|tx| !tx.try_send(Arc::clone(&panel_event)).is_err());
             },
             publish = rx.recv() => {
                 let publish = publish.unwrap();
-                handle_publish(&topic_prefix, &cfg.elk.areas, code, &mut panel, publish).await;
+                handle_publish(&topic_prefix, &cfg.elk.areas, code, &mut panel, publish, &panel_span).await;
+            }
+            to_panel = to_panel_rx.recv() => {
+                let to_panel = to_panel.expect("to_panel_tx should never be dropped");
+                panel.send(to_panel).instrument(panel_span.clone()).await.expect("panel send should not fail");
             }
         }
     }

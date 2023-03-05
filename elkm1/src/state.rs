@@ -76,11 +76,10 @@ use futures::{Future, Sink, SinkExt, Stream, StreamExt};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use tokio::net::ToSocketAddrs;
 use tokio::time::Sleep;
 
 use crate::msg::{self, Message};
-use crate::pkt;
+use crate::pkt::{self, Packet};
 use crate::tokio::Connection;
 
 /// Delay in applying an `ArmingReport` transition suspected of being spurious.
@@ -99,14 +98,40 @@ pub struct Panel {
 }
 
 impl Panel {
-    /// Connects to the panel.
+    /// Creates a new panel connection.
     ///
     /// Currently this completes all initialization steps before returning.
-    /// In a future version, it may instead with a stream that will later yield
-    /// a `Change::Initialized` event or some such.
-    pub async fn connect<A: ToSocketAddrs>(addr: A) -> Result<Self, std::io::Error> {
-        let conn = Connection::connect(addr).await?;
-        Self::with_connection(conn).await
+    /// In a future version, it may return immediately, return updates during
+    /// initialization, and later yield a `Change::Initialized` event or some
+    /// such.
+    #[tracing::instrument(name = "initialization", skip_all)]
+    pub async fn new(conn: Connection) -> Result<Self, std::io::Error> {
+        let mut this = Panel {
+            conn,
+            state: PanelState::default(),
+            pending_arm: None,
+            cmd_state: CmdState::Idle,
+        };
+        this.init_req(msg::ArmingStatusRequest {}.into()).await?;
+        this.init_req(msg::ZoneStatusRequest {}.into()).await?;
+        this.send_sds(msg::TextDescriptionType::Area, msg::NUM_AREAS)
+            .await?;
+        this.send_sds(msg::TextDescriptionType::Task, msg::NUM_TASKS)
+            .await?;
+        this.send_sds(msg::TextDescriptionType::Zone, msg::NUM_ZONES)
+            .await?;
+        /*for i in 0..NUM_ZONES {
+            if this.zone_status.as_deref().unwrap()[i].physical() != msg::ZonePhysicalStatus::Unconfigured {
+                this.init_req()
+            }
+        }*/
+        tracing::info!("initialized");
+        Ok(this)
+    }
+
+    #[inline]
+    pub fn peer_addr(&self) -> Result<std::net::SocketAddr, std::io::Error> {
+        self.conn.peer_addr()
     }
 
     pub fn zone_name(&self, zone: msg::Zone) -> &msg::TextDescription {
@@ -129,30 +154,6 @@ impl Panel {
             .zone_statuses
             .as_ref()
             .expect("zone_status is set post-init")
-    }
-
-    #[tracing::instrument(name = "initialization", skip_all)]
-    async fn with_connection(conn: Connection) -> Result<Self, std::io::Error> {
-        let mut this = Panel {
-            conn,
-            state: PanelState::default(),
-            pending_arm: None,
-            cmd_state: CmdState::Idle,
-        };
-        this.init_req(msg::ArmingStatusRequest {}.into()).await?;
-        this.init_req(msg::ZoneStatusRequest {}.into()).await?;
-        this.send_sds(msg::TextDescriptionType::Area, msg::NUM_AREAS)
-            .await?;
-        this.send_sds(msg::TextDescriptionType::Task, msg::NUM_TASKS)
-            .await?;
-        this.send_sds(msg::TextDescriptionType::Zone, msg::NUM_ZONES)
-            .await?;
-        /*for i in 0..NUM_ZONES {
-            if this.zone_status.as_deref().unwrap()[i].physical() != msg::ZonePhysicalStatus::Unconfigured {
-                this.init_req()
-            }
-        }*/
-        Ok(this)
     }
 
     /// Sends a message as part of initialization and waits for the reply.
@@ -236,13 +237,13 @@ impl Panel {
                 }
                 _ => {}
             }
-            if let CmdState::Busy { request, waker, .. } = &mut self.cmd_state {
+            if let CmdState::Busy { request: Some(request), waker, .. } = &mut self.cmd_state {
                 if m.is_response_to(request) {
                     if let Some(w) = waker.take() {
                         w.wake();
                     }
                     reply_to = match std::mem::replace(&mut self.cmd_state, CmdState::Idle) {
-                        CmdState::Busy { request, .. } => Some(request),
+                        CmdState::Busy { request, .. } => request,
                         _ => unreachable!(),
                     };
                 }
@@ -378,11 +379,11 @@ impl Sink<Command> for Panel {
     fn start_send(self: Pin<&mut Self>, item: Command) -> Result<(), Self::Error> {
         let this = Pin::into_inner(self);
         assert!(matches!(this.cmd_state, CmdState::Idle));
-        let msg = item.into_msg();
-        tracing::debug!(?msg, "sending message");
-        this.conn.start_send_unpin(msg.to_pkt())?;
+        tracing::debug!(command = ?item, "sending command");
+        let (request, pkt) = item.destructure();
+        this.conn.start_send_unpin(pkt)?;
         this.cmd_state = CmdState::Busy {
-            request: msg,
+            request,
             flushed: false,
             waker: None,
         };
@@ -395,12 +396,15 @@ impl Sink<Command> for Panel {
     ) -> Poll<Result<(), Self::Error>> {
         let this = Pin::into_inner(self);
         match &mut this.cmd_state {
-            CmdState::Busy { flushed, .. } if !*flushed => {
+            CmdState::Busy { flushed, ref request, .. } if !*flushed => {
                 match this.conn.poll_flush_unpin(cx) {
                     Poll::Ready(Ok(())) => {}
                     o => return o,
                 }
                 *flushed = true;
+                if request.is_none() {
+                    this.cmd_state = CmdState::Idle;
+                }
             }
             _ => {}
         }
@@ -508,21 +512,34 @@ pub enum Change {
 pub enum Command {
     Arm(msg::ArmRequest),
     ActivateTask(msg::ActivateTask),
+
+    /// Sends on a packet, without interpretation or flagging it as needing a
+    /// response.
+    /// 
+    /// TODO: this is an experiment; we may end up trying to interpret these to
+    /// identify the responses for flow control.
+    Raw(pkt::Packet),
 }
 
 impl Command {
-    fn into_msg(self) -> Message {
-        match self {
-            Command::Arm(m) => m.into(),
-            Command::ActivateTask(m) => m.into(),
-        }
+    /// Destructures into an optional message to match responses against and the packet to send.
+    fn destructure(self) -> (Option<Message>, Packet) {
+        let request_needing_response: Message = match self {
+            Command::Arm(msg) => msg.into(),
+            Command::ActivateTask(msg) => msg.into(),
+            Command::Raw(pkt) => {
+                return (None, pkt);
+            }
+        };
+        let pkt = request_needing_response.to_pkt();
+        (Some(request_needing_response), pkt)
     }
 }
 
 enum CmdState {
     Idle,
     Busy {
-        request: Message,
+        request: Option<Message>,
         flushed: bool,
 
         /// A waker to awaken when transitioning to `Idle` state.
@@ -608,7 +625,7 @@ mod tests {
             crate::msg::ZonePhysicalStatus::EOL,
         );
         let (_, client_state) = tokio::join!(serve_init(&mut server, &state), async {
-            Panel::with_connection(client).await.unwrap().state
+            Panel::new(client).await.unwrap().state
         },);
         assert_eq!(client_state, state);
     }

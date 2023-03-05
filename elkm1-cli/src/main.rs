@@ -16,7 +16,8 @@ enum Cmd {
 }
 
 async fn watch(addr: String) {
-    let panel = state::Panel::connect(&addr).await.unwrap();
+    let panel = elkm1::tokio::Connection::connect(&addr).await.unwrap();
+    let panel = state::Panel::new(panel).await.unwrap();
     tracing::info!("tracking changes");
     tokio::pin!(panel);
     while let Some(pkt) = panel.next().await {
