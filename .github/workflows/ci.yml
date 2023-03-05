@@ -34,8 +34,10 @@ jobs:
         toolchain: ${{ matrix.rust }}
         override: true
         components: ${{ matrix.extra_components }}
-    - name: Test
-      run: cargo test --workspace --all-targets
+    - name: Test (no features)
+      run: cargo test --no-default-features --workspace --all-targets
+    - name: Test (all features)
+      run: cargo test --all-features --workspace --all-targets
     - name: Check fuzz tests compile (but don't actually fuzz)
       run: cd fuzz && cargo check && cargo test
     - name: Check main workspace formatting

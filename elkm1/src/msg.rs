@@ -523,8 +523,7 @@ macro_rules! limited_u8 {
         #[cfg(feature = "arbitrary")]
         impl Arbitrary<'_> for $t {
             fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-                let b: u8 = Arbitrary::from(u);
-                $t::try_from(b).map_err(|_| arbitrary::Error::IncorrectFormat)
+                Ok(Self(u.int_in_range(0..=$max)?))
             }
 
             fn size_hint(depth: usize) -> (usize, Option<usize>) {
@@ -573,7 +572,7 @@ macro_rules! limited_u8 {
 /// This currently enforces the ranges mentioned in Elk's spec, e.g. day can't be more than 31.
 /// It doesn't use a real date library and thus doesn't prevent silly dates like February 30th.
 #[derive(Copy, Clone, PartialEq, Eq)]
-struct DateTime {
+pub struct DateTime {
     year: u8,
     month: u8,
     day: u8,
@@ -645,6 +644,24 @@ impl DateTime {
     }
 }
 
+#[cfg(feature = "arbitrary")]
+impl Arbitrary<'_> for DateTime {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
+        Ok(Self {
+            year: u.int_in_range(0..=99)?,
+            month: u.int_in_range(1..=12)?,
+            day: u.int_in_range(0..=31)?,
+            hour: u.int_in_range(0..=23)?,
+            minute: u.int_in_range(0..=59)?,
+            second: u.int_in_range(0..=59)?,
+        })
+    }
+
+    fn size_hint(_depth: usize) -> (usize, Option<usize>) {
+        (6, None)
+    }
+}
+
 #[cfg(feature = "serde")]
 impl Serialize for DateTime {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -683,9 +700,10 @@ impl std::fmt::Display for DateTime {
     }
 }
 
-/// Real-time clock date: datetime and flags.
+/// Real-time clock data: datetime and flags.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
 struct RtcData {
     datetime: DateTime,
     weekday: Weekday,
