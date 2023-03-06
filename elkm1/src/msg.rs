@@ -272,6 +272,20 @@ ascii_messages! {
         pub task: Task,
     }
 
+    /// `vn`: Version Number Request.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
+    struct VersionNumberRequest {
+    }
+
+    /// `VN`: Version Number Response.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
+    struct VersionNumberResponse {
+        m1: VersionNumber,
+        m1xep: VersionNumber,
+    }
+
     /// `XK`: Control RTC Broadcast / IP Communications Device Test (a heartbeat).
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all="camelCase"))]
@@ -337,6 +351,8 @@ impl Message {
             b"tn" => ActivateTask::from_ascii_data(data).map(Self::ActivateTask),
             b"TC" => TaskChange::from_ascii_data(data).map(Self::TaskChange),
             b"XK" => Heartbeat::from_ascii_data(data).map(Self::Heartbeat),
+            b"vn" => VersionNumberRequest::from_ascii_data(data).map(Self::VersionNumberRequest),
+            b"VN" => VersionNumberResponse::from_ascii_data(data).map(Self::VersionNumberResponse),
             b"ZC" => ZoneChange::from_ascii_data(data).map(Self::ZoneChange),
             b"zs" => ZoneStatusRequest::from_ascii_data(data).map(Self::ZoneStatusRequest),
             b"ZS" => ZoneStatusReport::from_ascii_data(data).map(Self::ZoneStatusReport),
@@ -1735,6 +1751,117 @@ impl SystemTroubleStatusResponse {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
+pub struct VersionNumber {
+    pub major: u8,
+    pub minor: u8,
+    pub patch: u8,
+}
+
+impl VersionNumber {
+    fn from_ascii_data(data: &[u8]) -> Result<Self, String> {
+        Ok(Self {
+            major: AsciiPacket::dehex_byte(data[0], data[1]).map_err(|_| "bad major".to_owned())?,
+            minor: AsciiPacket::dehex_byte(data[2], data[3]).map_err(|_| "bad minor".to_owned())?,
+            patch: AsciiPacket::dehex_byte(data[4], data[5]).map_err(|_| "bad patch".to_owned())?,
+        })
+    }
+    fn to_ascii(self) -> impl Iterator<Item = u8> {
+        [
+            AsciiPacket::hex_byte(self.major),
+            AsciiPacket::hex_byte(self.minor),
+            AsciiPacket::hex_byte(self.patch),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+#[cfg(feature = "serde")]
+impl Serialize for VersionNumber {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+impl FromStr for VersionNumber {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut parts = s.splitn(3, '.');
+        if let (Some(major), Some(minor), Some(patch)) = (parts.next(), parts.next(), parts.next())
+        {
+            let major = str::parse::<u8>(major).map_err(|_| "bad major".to_owned())?;
+            let minor = str::parse::<u8>(minor).map_err(|_| "bad minor".to_owned())?;
+            let patch = str::parse::<u8>(patch).map_err(|_| "bad patch".to_owned())?;
+            return Ok(Self {
+                major,
+                minor,
+                patch,
+            });
+        }
+        Err("expected MAJOR.MINOR.PATCH".to_owned())
+    }
+}
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for VersionNumber {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s: &str = Deserialize::deserialize(deserializer)?;
+        VersionNumber::from_str(s).map_err(|_| {
+            D::Error::invalid_value(
+                serde::de::Unexpected::Str(s),
+                &"a version of the form MAJOR.MINOR.PATCH",
+            )
+        })
+    }
+}
+impl std::fmt::Display for VersionNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:02}.{:02}.{:02}", self.major, self.minor, self.patch)
+    }
+}
+
+impl VersionNumberRequest {
+    fn from_ascii_data(_data: &[u8]) -> Result<Self, String> {
+        Ok(VersionNumberRequest {})
+    }
+    fn to_ascii(self) -> AsciiPacket {
+        AsciiPacket::try_from("vn00").expect("VersionNumberRequest valid")
+    }
+    fn is_response_to(&self, _request: &Message) -> bool {
+        false
+    }
+}
+
+impl VersionNumberResponse {
+    fn from_ascii_data(data: &[u8]) -> Result<Self, String> {
+        if data.len() < 12 {
+            return Err("VersionNumberResponse should be at least 12 bytes".into());
+        }
+        Ok(Self {
+            m1: VersionNumber::from_ascii_data(&data[0..6])?,
+            m1xep: VersionNumber::from_ascii_data(&data[6..12])?,
+        })
+    }
+    fn to_ascii(self) -> AsciiPacket {
+        let msg: Vec<u8> = [b'V', b'N']
+            .into_iter()
+            .chain(self.m1.to_ascii())
+            .chain(self.m1xep.to_ascii())
+            .chain(std::iter::repeat(b'0').take(38))
+            .collect();
+        AsciiPacket::try_from(msg).expect("RtcResponse valid")
+    }
+    fn is_response_to(&self, request: &Message) -> bool {
+        matches!(request, Message::VersionNumberRequest(_))
+    }
+}
+
 /// Represents an optional zone number that is in trouble.
 ///
 /// This is meant to be like an `Option<Zone>`, but the Elk protocol has an
@@ -2042,6 +2169,37 @@ mod tests {
             })
         );
         assert_eq!(msg.to_pkt(), pkt);
+    }
+
+    #[test]
+    fn valid_vn_response() {
+        let pkt = Packet::Ascii(
+            AsciiPacket::try_from("VN05010C01030200000000000000000000000000000000000000").unwrap(),
+        );
+        let msg = Message::parse(&pkt).unwrap().unwrap();
+        assert_eq!(
+            msg,
+            Message::VersionNumberResponse(VersionNumberResponse {
+                m1: VersionNumber::from_str("05.01.12").unwrap(),
+                m1xep: VersionNumber::from_str("01.03.02").unwrap(),
+            })
+        );
+        assert_eq!(msg.to_pkt(), pkt);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn version_number_serde() {
+        let v = serde_json::from_str::<VersionNumber>("\"05.01.12\"").unwrap();
+        assert_eq!(
+            v,
+            VersionNumber {
+                major: 5,
+                minor: 1,
+                patch: 12,
+            },
+        );
+        assert_eq!("\"05.01.12\"", serde_json::to_string(&v).unwrap());
     }
 
     #[test]
