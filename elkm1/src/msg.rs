@@ -524,7 +524,7 @@ macro_rules! limited_u8 {
         #[cfg(feature = "arbitrary")]
         impl Arbitrary<'_> for $t {
             fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-                Ok(Self(u.int_in_range(0..=$max)?))
+                Ok(Self(u.int_in_range(1..=$max)?))
             }
 
             fn size_hint(depth: usize) -> (usize, Option<usize>) {
@@ -652,7 +652,7 @@ impl Arbitrary<'_> for DateTime {
         Ok(Self {
             year: u.int_in_range(0..=99)?,
             month: u.int_in_range(1..=12)?,
-            day: u.int_in_range(0..=31)?,
+            day: u.int_in_range(1..=31)?,
             hour: u.int_in_range(0..=23)?,
             minute: u.int_in_range(0..=59)?,
             second: u.int_in_range(0..=59)?,
