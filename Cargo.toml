@@ -4,3 +4,5 @@ members = [
     "elkm1-cli",
     "elkm1-mqtt",
 ]
+
+resolver = "2"

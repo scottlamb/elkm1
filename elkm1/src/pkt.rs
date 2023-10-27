@@ -274,7 +274,7 @@ impl AsciiPacket {
 
     /// Checks that `data` contains only printable ASCII characters.
     pub(crate) fn check_printable(value: &[u8]) -> Result<(), String> {
-        if let Some(i) = value.iter().position(|&b| b < 0x20 || b > 0x7e) {
+        if let Some(i) = value.iter().position(|b| !(0x20..=0x7e).contains(b)) {
             return Err(format!("non-printable character at index {}", i));
         }
         Ok(())

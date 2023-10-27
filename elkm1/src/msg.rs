@@ -83,22 +83,22 @@ macro_rules! messages {
             #[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
             pub struct $m $body
 
-            impl Into<Message> for $m {
+            impl From<$m> for Message {
                 #[inline]
-                fn into(self) -> Message {
-                    Message::$m(self)
+                fn from(m: $m) -> Self {
+                    Self::$m(m)
                 }
             }
-            impl Into<AsciiPacket> for &$m {
+            impl From<&$m> for AsciiPacket {
                 #[inline]
-                fn into(self) -> AsciiPacket {
-                    self.to_ascii()
+                fn from(m: &$m) -> Self {
+                    m.to_ascii()
                 }
             }
-            impl Into<Packet> for &$m {
+            impl From<&$m> for Packet {
                 #[inline]
-                fn into(self) -> Packet {
-                    Packet::Ascii(self.to_ascii())
+                fn from(m: &$m) -> Self {
+                    Self::Ascii(m.to_ascii())
                 }
             }
         )*
@@ -280,9 +280,10 @@ impl Message {
     }
 }
 
-impl Into<Packet> for &Message {
-    fn into(self) -> Packet {
-        self.to_pkt()
+impl From<&Message> for Packet {
+    #[inline]
+    fn from(m: &Message) -> Self {
+        m.to_pkt()
     }
 }
 
@@ -432,7 +433,7 @@ impl TryFrom<&[u8]> for ArmCode {
         }
         let mut code = [0u8; 6];
         code.copy_from_slice(value);
-        if code.iter().any(|&b| b < b'0' || b > b'9') {
+        if code.iter().any(|b| !b.is_ascii_digit()) {
             return Err("ArmCode must be numeric".to_owned());
         }
         Ok(ArmCode(code))
@@ -547,7 +548,7 @@ macro_rules! limited_u8 {
             type Error = String;
 
             fn try_from(val: u8) -> Result<Self, Self::Error> {
-                if val < 1 || val > $max {
+                if !(1..=$max).contains(&val) {
                     return Err(format!(
                         "{} not in expected {} range of [1, {}]",
                         val,
@@ -559,9 +560,10 @@ macro_rules! limited_u8 {
             }
         }
 
-        impl Into<u8> for $t {
-            fn into(self) -> u8 {
-                self.0
+        impl From<$t> for u8 {
+            #[inline]
+            fn from(t: $t) -> Self {
+                t.0
             }
         }
     };
@@ -588,21 +590,21 @@ impl DateTime {
             return Err("wrong length".to_owned());
         }
         let year = u16::from_str(&val[..4]).map_err(|_| "bad year".to_owned())?;
-        if year < 2000 || year > 2100 {
+        if !(2000..=2100).contains(&year) {
             return Err(format!("year {} out of range", year));
         }
         if &val[4..5] != "-" {
             return Err("bad year-month separator".to_owned());
         }
         let month = u8::from_str(&val[5..7]).map_err(|_| "bad month".to_owned())?;
-        if month < 1 || month > 12 {
+        if !(1..=12).contains(&month) {
             return Err(format!("month {} out of range", month));
         }
         if &val[7..8] != "-" {
             return Err("bad month-day separator".to_owned());
         }
         let day = u8::from_str(&val[8..10]).map_err(|_| "bad day".to_owned())?;
-        if day < 1 || day > 31 {
+        if !(1..=31).contains(&day) {
             return Err(format!("day {} out of range", day));
         }
         if &val[10..11] != "T" {
@@ -636,7 +638,7 @@ impl DateTime {
         })
     }
 
-    pub fn to_iso_8601(&self) -> String {
+    pub fn to_iso_8601(self) -> String {
         format!(
             "20{:02}-{:02}-{:02}T{:02}:{:02}:{:02}",
             self.year, self.month, self.day, self.hour, self.minute, self.second
@@ -720,11 +722,11 @@ impl RtcData {
         let year = parse_u8_dec("year", &data[11..13])?;
         debug_assert!(year < 100);
         let month = parse_u8_dec("month", &data[9..11])?;
-        if month < 1 || month > 12 {
+        if !(1..=12).contains(&month) {
             return Err("month out of range".to_owned());
         }
         let day = parse_u8_dec("day", &data[7..9])?;
-        if day < 1 || day > 31 {
+        if !(1..=31).contains(&day) {
             return Err("day out of range".to_owned());
         }
         let hour = parse_u8_dec("hour", &data[4..6])?;
@@ -763,7 +765,7 @@ impl RtcData {
         })
     }
 
-    fn to_ascii(&self) -> impl Iterator<Item = u8> {
+    fn to_ascii(self) -> impl Iterator<Item = u8> {
         format!(
             "{:02}{:02}{:02}{:01}{:02}{:02}{:02}{:01}{:01}{:01}",
             self.datetime.second,
@@ -948,7 +950,7 @@ impl ZoneChange {
             status: ZoneStatus::from_ascii(data[3])?,
         })
     }
-    fn to_ascii(&self) -> AsciiPacket {
+    fn to_ascii(self) -> AsciiPacket {
         let msg = format!("ZC{:03}{:1X}00", self.zone, self.status.0);
         AsciiPacket::try_from(msg).expect("ZoneChange invalid")
     }
@@ -988,7 +990,7 @@ impl ZoneStatusReport {
         }
         Ok(ZoneStatusReport { zones })
     }
-    fn to_ascii(&self) -> AsciiPacket {
+    fn to_ascii(self) -> AsciiPacket {
         let mut msg = Vec::with_capacity(4 + NUM_ZONES);
         msg.extend(b"ZS");
         for s in &self.zones {
@@ -1261,7 +1263,7 @@ impl RtcRequest {
     fn from_ascii_data(_data: &[u8]) -> Result<Self, String> {
         Ok(RtcRequest {})
     }
-    fn to_ascii(&self) -> AsciiPacket {
+    fn to_ascii(self) -> AsciiPacket {
         AsciiPacket::try_from("rr00").expect("RtcResponse valid")
     }
     fn is_response_to(&self, _request: &Message) -> bool {
@@ -1275,7 +1277,7 @@ impl RtcResponse {
             rtc_data: RtcData::from_ascii(data)?,
         })
     }
-    fn to_ascii(&self) -> AsciiPacket {
+    fn to_ascii(self) -> AsciiPacket {
         let msg: Vec<u8> = [b'R', b'R']
             .iter()
             .copied()
@@ -1488,7 +1490,7 @@ impl Heartbeat {
             rtc_data: RtcData::from_ascii(data)?,
         })
     }
-    fn to_ascii(&self) -> AsciiPacket {
+    fn to_ascii(self) -> AsciiPacket {
         let msg: Vec<u8> = [b'X', b'K']
             .iter()
             .copied()

@@ -519,6 +519,7 @@ impl Command {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum CmdState {
     Idle,
     Busy {
