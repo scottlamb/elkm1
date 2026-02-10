@@ -329,7 +329,7 @@ async fn handle_publish(
 async fn run_eventloop(
     mut eventloop: rumqttc::EventLoop,
     tx: tokio::sync::mpsc::UnboundedSender<rumqttc::Publish>,
-) {
+) -> ! {
     loop {
         let notification = eventloop.poll().await.unwrap();
         tracing::trace!(?notification, "mqtt notification");
@@ -338,6 +338,15 @@ async fn run_eventloop(
             tx.send(p).unwrap();
         }
         // TODO: examine other messages. ensure acks come?
+    }
+}
+
+struct JiffTimer;
+
+impl tracing_subscriber::fmt::time::FormatTime for JiffTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        const TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6f";
+        write!(w, "{}", jiff::Zoned::now().strftime(TIME_FORMAT))
     }
 }
 
@@ -351,7 +360,7 @@ fn setup_tracing() {
         tracing_subscriber::fmt::Layer::new()
             .map_fmt_fields(|f| f.debug_alt())
             .with_thread_names(true)
-            .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
+            .with_timer(JiffTimer)
             .with_filter(filter),
     );
     tracing::subscriber::set_global_default(sub).unwrap();
@@ -359,11 +368,6 @@ fn setup_tracing() {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    // SAFETY: let's assume nothing touches environment variables.
-    unsafe {
-        time::util::local_offset::set_soundness(time::util::local_offset::Soundness::Unsound);
-    }
-
     setup_tracing();
     let mut args = std::env::args_os();
     let _ = args.next().expect("no argv[0]");
@@ -376,17 +380,21 @@ async fn main() {
 
     let mut mqtt_opts =
         rumqttc::MqttOptions::new(&cfg.mqtt.client_id, &cfg.mqtt.host, cfg.mqtt.port);
-    match (cfg.mqtt.username, cfg.mqtt.password) {
+    match (&cfg.mqtt.username, &cfg.mqtt.password) {
         (Some(u), Some(p)) => {
             mqtt_opts.set_credentials(u, p);
         }
         (None, None) => {}
         _ => panic!("username without password or vice versa"),
     }
-    let topic_prefix = cfg
-        .mqtt
-        .topic_prefix
-        .unwrap_or_else(|| format!("elkm1/{}", &cfg.elk.serial_number));
+    let default_topic_prefix;
+    let topic_prefix = match &cfg.mqtt.topic_prefix {
+        Some(p) => p,
+        None => {
+            default_topic_prefix = format!("elkm1/{}", &cfg.elk.serial_number);
+            &default_topic_prefix
+        }
+    };
     mqtt_opts.set_last_will(rumqttc::LastWill {
         topic: format!("{}/availability", &topic_prefix),
         message: "offline".into(),
@@ -394,18 +402,29 @@ async fn main() {
         retain: true,
     });
     let (mqtt_cli, mqtt_eventloop) = rumqttc::AsyncClient::new(mqtt_opts, 10);
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(run_eventloop(mqtt_eventloop, tx));
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::select! {
+        _ = run_eventloop(mqtt_eventloop, tx) => {}
+        _ = inner(&cfg, topic_prefix, mqtt_cli, rx) => {}
+    }
+}
+
+async fn inner(
+    cfg: &Cfg,
+    topic_prefix: &str,
+    mqtt_cli: rumqttc::AsyncClient,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<rumqttc::Publish>,
+) {
     let panel = state::Panel::connect(&cfg.elk.host_port).await.unwrap();
     tracing::info!("panel initialized");
     let code = elkm1::msg::ArmCode::try_from(cfg.elk.code).unwrap();
-    if let Some(ha_discovery_prefix) = cfg.mqtt.ha_discovery_prefix {
-        publish_ha_discovery(&mqtt_cli, &topic_prefix, &ha_discovery_prefix, &cfg.elk).await;
+    if let Some(ha_discovery_prefix) = &cfg.mqtt.ha_discovery_prefix {
+        publish_ha_discovery(&mqtt_cli, topic_prefix, ha_discovery_prefix, &cfg.elk).await;
     }
-    publish_area_states(&mqtt_cli, &panel, &topic_prefix, &cfg.elk.areas).await;
+    publish_area_states(&mqtt_cli, &panel, topic_prefix, &cfg.elk.areas).await;
     for (&zone_id, zone_cfg) in &cfg.elk.zones {
         let zone = elkm1::msg::Zone::try_from(zone_id).unwrap();
-        publish_zone_state(&mqtt_cli, &panel, &topic_prefix, zone, zone_cfg).await;
+        publish_zone_state(&mqtt_cli, &panel, topic_prefix, zone, zone_cfg).await;
     }
     let sub_topics = cfg.elk.areas.values().map(|a| rumqttc::SubscribeFilter {
         path: format!("{}/area/{}/ha_command", &topic_prefix, &a.name),
@@ -435,21 +454,21 @@ async fn main() {
                 ).await.unwrap();
                 match &panel_event.change {
                     Some(elkm1::state::Change::ArmingStatus { .. }) => {
-                        publish_area_states(&mqtt_cli, &panel, &topic_prefix, &cfg.elk.areas).await;
+                        publish_area_states(&mqtt_cli, &panel, topic_prefix, &cfg.elk.areas).await;
                     }
                     Some(elkm1::state::Change::ZoneChange { zone, .. }) => {
                         let zone_cfg = match cfg.elk.zones.get(&(*zone).into()) {
                             None => continue,
                             Some(c) => c,
                         };
-                        publish_zone_state(&mqtt_cli, &panel, &topic_prefix, *zone, zone_cfg).await;
+                        publish_zone_state(&mqtt_cli, &panel, topic_prefix, *zone, zone_cfg).await;
                     }
                     _ => {}
                 }
             },
             publish = rx.recv() => {
                 let publish = publish.unwrap();
-                handle_publish(&topic_prefix, &cfg.elk.areas, code, &mut panel, publish).await;
+                handle_publish(topic_prefix, &cfg.elk.areas, code, &mut panel, publish).await;
             }
         }
     }

@@ -631,7 +631,7 @@ mod tests {
                     Some(pkt::Packet::Ascii(p)) => assert_eq!(&p[..], a.msg),
                     _ => unreachable!(),
                 }
-                (a.checker)(&event, &panel);
+                (a.checker)(&event, panel);
             });
         }
     }

@@ -1,8 +1,11 @@
 [workspace]
+resolver = "3"
 members = [
     "elkm1",
     "elkm1-cli",
     "elkm1-mqtt",
 ]
 
-resolver = "2"
+[workspace.dependencies]
+jiff = "0.2.15"
+pretty-hex = "0.4.1"

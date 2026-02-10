@@ -15,32 +15,32 @@ jobs:
         include:
           - rust: stable
             extra_components: rustfmt
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     steps:
-    - name: Checkout
-      uses: actions/checkout@v2
-    - name: Cache
-      uses: actions/cache@v2
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ matrix.rust }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-    - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        profile: minimal
-        toolchain: ${{ matrix.rust }}
-        override: true
-        components: ${{ matrix.extra_components }}
-    - name: Test (no features)
-      run: cargo test --no-default-features --workspace --all-targets
-    - name: Test (all features)
-      run: cargo test --all-features --workspace --all-targets
-    - name: Check fuzz tests compile (but don't actually fuzz)
-      run: cd fuzz && cargo check && cargo test
-    - name: Check main workspace formatting
-      run: cargo fmt -- --check
-    - name: Check fuzz crate formatting
-      run: cd fuzz && cargo fmt -- --check
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.rust }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          profile: minimal
+          toolchain: ${{ matrix.rust }}
+          override: true
+          components: ${{ matrix.extra_components }}
+      - name: Test (no features)
+        run: cargo test --no-default-features --workspace --all-targets
+      - name: Test (all features)
+        run: cargo test --all-features --workspace --all-targets
+      - name: Check fuzz tests compile (but don't actually fuzz)
+        run: cd fuzz && cargo check && cargo test
+      - name: Check main workspace formatting
+        run: cargo fmt -- --check
+      - name: Check fuzz crate formatting
+        run: cd fuzz && cargo fmt -- --check

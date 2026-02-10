@@ -68,6 +68,15 @@ fn read(filename: PathBuf) {
     }
 }
 
+struct JiffTimer;
+
+impl tracing_subscriber::fmt::time::FormatTime for JiffTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        const TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6f";
+        write!(w, "{}", jiff::Zoned::now().strftime(TIME_FORMAT))
+    }
+}
+
 fn setup_tracing() {
     use tracing_subscriber::prelude::*;
     tracing_log::LogTracer::init().unwrap();
@@ -78,7 +87,7 @@ fn setup_tracing() {
         tracing_subscriber::fmt::Layer::new()
             .map_fmt_fields(|f| f.debug_alt())
             .with_thread_names(true)
-            .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
+            .with_timer(JiffTimer)
             .with_filter(filter),
     );
     tracing::subscriber::set_global_default(sub).unwrap();
@@ -86,11 +95,6 @@ fn setup_tracing() {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    // SAFETY: let's assume nothing touches environment variables.
-    unsafe {
-        time::util::local_offset::set_soundness(time::util::local_offset::Soundness::Unsound);
-    }
-
     setup_tracing();
     match Cmd::parse() {
         Cmd::Watch { addr } => watch(addr).await,
